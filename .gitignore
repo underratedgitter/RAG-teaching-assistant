@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files (large, user-specific)
+embeddings.joblib
+embedding_matrix.npy
+
+# Media folders (user content)
+videos/
+audios/
+jsons/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
