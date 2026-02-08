@@ -1,0 +1,301 @@
+================================================================================
+RAG TEACHING ASSISTANT - COMPLETE PROCESS BREAKDOWN
+================================================================================
+
+This is a Retrieval-Augmented Generation (RAG) system that converts lecture 
+videos into an AI-powered Q&A system.
+
+
+================================================================================
+COMPLETE PIPELINE FLOW
+================================================================================
+
+Video Files → Audio Extraction → Transcription → Embeddings → Question Answering
+   (MP4)         (MP3)            (JSON)       (Vectors)      (AI Response)
+
+
+================================================================================
+1. PROJECT STRUCTURE
+================================================================================
+
+- videos/              - Uploaded video files (MP4, AVI, MKV, MOV)
+- audios/              - Extracted audio files (MP3)
+- jsons/               - Transcription chunks with metadata
+- embeddings.joblib    - Vector embeddings database
+- embedding_matrix.npy - Pre-computed similarity matrix
+
+
+================================================================================
+2. DETAILED PROCESS FLOW
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1: Dashboard Initialization (dashboard.py)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+What happens:
+  - Creates working directories (videos/, audios/, jsons/)
+  - Clears all previous data on startup (videos, audios, jsons, embeddings)
+  - Loads existing embeddings if available
+  - Launches GUI with Tkinter
+
+Tools used:
+  - tkinter       - GUI framework
+  - os            - File system operations
+  - joblib        - Loading cached embeddings
+  - numpy         - Loading embedding matrix
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2: Video Upload (dashboard.py)                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+What happens:
+  - User selects video files via file dialog
+  - Files are copied to videos/ directory
+  - Status updated with video count
+
+Tools used:
+  - tkinter.filedialog - File selection dialog
+  - shutil             - File copying operations
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 3: Video Processing (3 Sequential Steps)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 1: Video → Audio Conversion (video_to_mp3.py)
+────────────────────────────────────────────────────────────────────────────────
+
+What happens:
+  1. Scans videos/ folder for video files
+  2. Converts each video to MP3 format (audio only)
+  3. Names files as: 1_VideoName.mp3, 2_VideoName.mp3, etc.
+  4. Saves to audios/ directory
+  5. Uses parallel processing (4 workers) for speed
+
+Tools used:
+  - FFmpeg - Video/audio conversion engine
+      • -vn                  : Remove video stream
+      • -acodec libmp3lame   : MP3 encoder
+      • -q:a 4               : Audio quality level
+      • -threads 0           : Use all CPU cores
+  - subprocess           - Running FFmpeg commands
+  - ThreadPoolExecutor   - Parallel processing (up to 4 videos at once)
+
+Example:
+  Input:  videos/Lecture1.mp4
+  Output: audios/1_Lecture1.mp3
+
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 2: Audio → Text Transcription (mp3_to_json.py)
+────────────────────────────────────────────────────────────────────────────────
+
+What happens:
+  1. Loads Whisper AI model (OpenAI's speech recognition)
+  2. Transcribes each MP3 file to text
+  3. Splits transcription into time-stamped chunks (segments)
+  4. Extracts video number and title from filename
+  5. Saves as JSON with metadata
+
+Tools used:
+  - Whisper (OpenAI) - Speech-to-text AI model
+      • Model: base (faster) or tiny (fallback)
+      • language="en"    : English transcription
+      • fp16=False       : Precision mode
+  - PyTorch - Deep learning framework (GPU/CPU)
+      • CUDA for GPU acceleration
+  - json - Saving transcription data
+
+JSON Structure:
+  {
+    "chunks": [
+      {
+        "number": "1",
+        "title": "Lecture1",
+        "start": 0.0,
+        "end": 5.2,
+        "text": "Welcome to the lecture...",
+        "chunk_id": 0
+      },
+      ...
+    ],
+    "text": "Full transcription...",
+    "language": "en"
+  }
+
+Example:
+  Input:  audios/1_Lecture1.mp3
+  Output: jsons/1_Lecture1.mp3.json (with 50 chunks)
+
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 3: Text → Vector Embeddings (preprocess_json.py)
+────────────────────────────────────────────────────────────────────────────────
+
+What happens:
+  1. Loads all JSON files
+  2. Extracts text from each chunk
+  3. Converts text to 768-dimensional vectors (embeddings)
+  4. Creates searchable database
+  5. Saves embeddings for fast retrieval
+
+Tools used:
+  - Ollama - Local LLM server
+      • Model: nomic-embed-text - Embedding model
+      • API: http://localhost:11434/api/embed
+      • Batch size: 128 chunks at once
+  - pandas        - Data management (DataFrame)
+  - scikit-learn  - Cosine similarity computation
+  - joblib        - Saving embeddings (compressed)
+  - numpy         - Matrix operations (float32 for efficiency)
+  - requests      - HTTP calls to Ollama
+
+Why embeddings?
+  - Converts text to numbers that capture meaning
+  - Similar concepts have similar vector values
+  - Enables semantic search (not just keyword matching)
+
+Example:
+  Input:  "Welcome to the lecture" (text)
+  Output: [0.123, -0.456, 0.789, ...] (768 numbers)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 4: Question Answering (dashboard.py)                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+What happens when you ask a question:
+
+1. Embed Question
+   - Convert your question to vector using Ollama
+   - Same nomic-embed-text model
+
+2. Semantic Search
+   - Compare question vector with all chunk vectors
+   - Calculate cosine similarity scores
+   - Find top 5 most relevant chunks
+   
+3. Generate Answer
+   - Send relevant chunks + question to AI
+   - Model: Qwen2.5:1.5b (fast, smaller LLM)
+   - AI generates answer with video references
+
+Tools used:
+  - cosine_similarity (sklearn) - Finds similar vectors
+      • Formula: similarity = A · B / (||A|| × ||B||)
+      • Range: 0 (unrelated) to 1 (identical)
+  - Ollama - Answer generation
+      • Model: qwen2.5:1.5b - Language model
+      • temperature: 0.3  - Focused responses
+      • num_predict: 100  - Max 100 tokens
+
+Example Flow:
+  Question: "What is machine learning?"
+
+  1. Embed: [0.234, -0.567, ...] (768 numbers)
+
+  2. Search: Find similar chunks
+     - Video 1, 02:30 - "Machine learning is..." (similarity: 0.89)
+     - Video 3, 15:45 - "ML algorithms learn..." (similarity: 0.82)
+
+  3. Generate: AI reads chunks + question → Answer with timestamps
+
+
+================================================================================
+3. TECHNOLOGY STACK & RESPONSIBILITIES
+================================================================================
+
+┌──────────────────────┬─────────────────────────────┬──────────────────────┐
+│ Tool/Library         │ Purpose                     │ Used In              │
+├──────────────────────┼─────────────────────────────┼──────────────────────┤
+│ FFmpeg               │ Video→Audio conversion      │ video_to_mp3.py      │
+│ Whisper (OpenAI)     │ Audio→Text transcription    │ mp3_to_json.py       │
+│ PyTorch              │ GPU acceleration for Whisper│ mp3_to_json.py       │
+│ Ollama               │ Local LLM server            │ preprocess_json.py   │
+│                      │ (embeddings + chat)         │ dashboard.py         │
+│ nomic-embed-text     │ Text→Vector embeddings      │ preprocess_json.py   │
+│                      │                             │ dashboard.py         │
+│ qwen2.5:1.5b         │ Answer generation (LLM)     │ dashboard.py         │
+│ scikit-learn         │ Cosine similarity search    │ dashboard.py         │
+│ pandas               │ Data management             │ preprocess_json.py   │
+│                      │                             │ dashboard.py         │
+│ numpy                │ Matrix operations           │ preprocess_json.py   │
+│                      │                             │ dashboard.py         │
+│ joblib               │ Save/load embeddings        │ preprocess_json.py   │
+│                      │                             │ dashboard.py         │
+│ tkinter              │ GUI interface               │ dashboard.py         │
+│ requests             │ HTTP calls to Ollama        │ preprocess_json.py   │
+│                      │                             │ dashboard.py         │
+└──────────────────────┴─────────────────────────────┴──────────────────────┘
+
+
+================================================================================
+4. PERFORMANCE OPTIMIZATIONS
+================================================================================
+
+1.  Parallel Video Conversion    - 4 videos at once using ThreadPoolExecutor
+2.  Base Whisper Model            - 3-5x faster than larger models
+3.  GPU Acceleration              - CUDA for Whisper transcription
+4.  Batch Embeddings              - 128 chunks per request
+5.  Pre-computed Matrix           - Similarity search in milliseconds
+6.  Float32 Precision             - 50% less memory than float64
+7.  Compressed Storage            - joblib with compression level 3
+8.  Connection Pooling            - Reuses HTTP connections to Ollama
+9.  Retry Logic                   - Auto-retry failed API calls
+10. Cache Cleanup                 - Clears old data on startup
+
+
+================================================================================
+5. DATA LIFECYCLE
+================================================================================
+
+User Upload → Processing → Indexing → Querying
+     ↓            ↓            ↓          ↓
+  videos/      audios/      jsons/    Search DB
+             (temp)      (temp)    (embeddings)
+
+Note: On Startup - All folders are cleared to ensure fresh processing
+
+
+================================================================================
+6. KEY CONCEPTS
+================================================================================
+
+RAG (Retrieval-Augmented Generation):
+  - Instead of AI guessing, it retrieves relevant information first
+  - Then generates answer based on actual content
+  - More accurate and factual than pure generation
+
+Vector Embeddings:
+  - Text → Numbers that capture meaning
+  - Similar meanings → Similar numbers
+  - Enables "smart search" beyond keywords
+
+Cosine Similarity:
+  - Measures angle between vectors
+  - Ignores magnitude, focuses on direction
+  - Perfect for semantic similarity
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+The system creates a searchable knowledge base from your videos, allowing 
+natural language queries with precise video references and timestamps!
+
+Process Flow:
+  1. Upload videos → System storage
+  2. Extract audio → FFmpeg converts to MP3
+  3. Transcribe speech → Whisper AI creates text chunks
+  4. Create embeddings → Ollama converts text to vectors
+  5. Ask questions → AI searches and generates answers
+
+
+================================================================================
+End of Documentation
+================================================================================
