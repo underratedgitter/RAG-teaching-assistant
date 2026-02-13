@@ -17,9 +17,10 @@ RUN curl https://ollama.ai/install.sh | bash
 # Copy requirements
 COPY requirements_streamlit.txt requirements.txt
 
-# Install Python packages (with setuptools for build dependencies)
+# Install Python packages (use only binary wheels to avoid long compilation)
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
+    pip install --only-binary :all: --default-timeout=1000 -r requirements.txt || \
+    pip install --default-timeout=1000 -r requirements.txt
 
 # Copy application
 COPY streamlit_app.py .
