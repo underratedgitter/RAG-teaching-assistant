@@ -19,13 +19,6 @@ COPY requirements_streamlit.txt requirements.txt
 RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download Ollama models (KEY FOR PERFORMANCE!)
-RUN ollama serve & \
-    sleep 10 && \
-    ollama pull nomic-embed-text && \
-    ollama pull qwen2.5:1.5b && \
-    pkill -f "ollama serve"
-
 # Copy application
 COPY streamlit_app.py .
 
