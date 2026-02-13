@@ -1,3 +1,14 @@
+---
+title: RAG Teaching Assistant
+emoji: 🎓
+colorFrom: blue
+colorTo: purple
+sdk: docker
+sdk_version: latest
+app_file: streamlit_app.py
+pinned: false
+---
+
 # 🎓 RAG Teaching Assistant
 
 > **Ask questions about your videos, get AI-powered answers with timestamps**
