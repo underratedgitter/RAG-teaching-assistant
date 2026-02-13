@@ -15,8 +15,9 @@ RUN curl https://ollama.ai/install.sh | bash
 # Copy requirements
 COPY requirements_streamlit.txt requirements.txt
 
-# Install Python packages
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python packages (with setuptools for build dependencies)
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Pre-download Ollama models (KEY FOR PERFORMANCE!)
 RUN ollama serve & \
