@@ -5,7 +5,6 @@ import shutil
 import threading
 import subprocess
 import sys
-import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import joblib
@@ -240,6 +239,7 @@ class RAGDashboard:
             r = requests.post("http://localhost:11434/api/embed", 
                 json={"model": "nomic-embed-text", "input": [question]},
                 timeout=30)
+            r.raise_for_status()
             q_embed = r.json()["embeddings"][0]
             
             self.log_safe("Searching... (top 5 results)")
@@ -265,6 +265,7 @@ Provide a concise answer with video/timestamp references only.'''
                     "options": {"num_predict": 100, "num_gpu": 99, "temperature": 0.3}
                 },
                 timeout=60)
+            r.raise_for_status()
             response = r.json()["response"]
             
             self.log_safe("Done!")
