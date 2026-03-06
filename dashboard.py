@@ -9,6 +9,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import joblib
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class RAGDashboard:
@@ -30,7 +32,15 @@ class RAGDashboard:
         self.embedding_matrix = None
         self.load_embeddings()
         
+        # Reusable HTTP session with connection pooling
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2)
+        self.session.mount('http://', adapter)
+        
         self.create_ui()
+        
+        # Pre-warm Ollama models in background so first query is fast
+        threading.Thread(target=self._warm_models, daemon=True).start()
 
     def _clear_work_dirs_on_start(self):
         """Remove all videos, audios, jsons, and embedding cache on launch."""
@@ -110,6 +120,18 @@ class RAGDashboard:
         self.update_status()
         self.log("Ready. Upload videos and click 'Process Videos' to start.")
         
+    def _warm_models(self):
+        """Pre-warm Ollama models to avoid cold-start latency."""
+        try:
+            self.session.post("http://localhost:11434/api/embed",
+                json={"model": "nomic-embed-text", "input": ["warmup"]}, timeout=30)
+            self.session.post("http://localhost:11434/api/generate",
+                json={"model": "qwen2.5:1.5b", "prompt": "hi", "stream": False,
+                      "options": {"num_predict": 1}}, timeout=30)
+            self.log_safe("Models warmed up - ready for queries.")
+        except Exception:
+            pass
+
     def log(self, text):
         """Add text to terminal"""
         self.terminal.insert("end", text + "\n")
@@ -236,35 +258,56 @@ class RAGDashboard:
     def _answer(self, question):
         try:
             self.log_safe("Creating embedding...")
-            r = requests.post("http://localhost:11434/api/embed", 
+            r = self.session.post("http://localhost:11434/api/embed", 
                 json={"model": "nomic-embed-text", "input": [question]},
                 timeout=30)
             r.raise_for_status()
             q_embed = r.json()["embeddings"][0]
             
-            self.log_safe("Searching... (top 5 results)")
+            self.log_safe("Searching... (top 8 results)")
             matrix = self.embedding_matrix if self.embedding_matrix is not None else np.vstack(self.df['embedding'].values)
             sims = cosine_similarity(matrix.astype(np.float32), 
                                     np.array([q_embed], dtype=np.float32)).flatten()
-            top_idx = sims.argsort()[::-1][:5]
+            top_idx = sims.argsort()[::-1][:8]
+            # Filter out low-similarity results
+            top_idx = [i for i in top_idx if sims[i] > 0.3]
+            if not top_idx:
+                top_idx = sims.argsort()[::-1][:3].tolist()
             chunks = self.df.loc[top_idx]
             
             self.log_safe("Generating response...")
-            # Use simpler prompt for faster response
-            prompt = f'''Video subtitles:
-{chunks[["title", "number", "start", "end", "text"]].to_json(orient="records")}
-
-Q: {question}
-Provide a concise answer with video/timestamp references only.'''
+            # Build readable context with timestamps
+            context_parts = []
+            for _, row in chunks.iterrows():
+                mins_s, secs_s = divmod(int(row['start']), 60)
+                mins_e, secs_e = divmod(int(row['end']), 60)
+                context_parts.append(
+                    f"[Video {row['number']}: {row['title']} | {mins_s}:{secs_s:02d}-{mins_e}:{secs_e:02d}]\n{row['text']}"
+                )
+            context_str = "\n\n".join(context_parts)
             
-            r = requests.post("http://localhost:11434/api/generate", 
+            prompt = f'''You are a teaching assistant. Answer the student's question using ONLY the lecture transcript excerpts below. Be accurate and helpful.
+
+--- LECTURE EXCERPTS ---
+{context_str}
+--- END EXCERPTS ---
+
+Student Question: {question}
+
+Instructions:
+- Answer based strictly on the provided excerpts.
+- Reference the video number and timestamp (e.g., "In Video 1 at 2:30...").
+- If the excerpts don't contain enough info, say so.
+- Be concise but thorough.'''
+            
+            r = self.session.post("http://localhost:11434/api/generate", 
                 json={
                     "model": "qwen2.5:1.5b",
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": 100, "num_gpu": 99, "temperature": 0.3}
+                    "options": {"num_predict": 300, "num_gpu": 99, "temperature": 0.2, "top_p": 0.9}
                 },
-                timeout=60)
+                timeout=120)
             r.raise_for_status()
             response = r.json()["response"]
             

@@ -46,6 +46,45 @@ def create_embedding(text_list, batch_size=128):
     return all_embeddings
 
 
+def merge_segments(chunks, target_words=150, overlap_words=30):
+    """Merge small Whisper segments into larger overlapping chunks for better retrieval."""
+    if not chunks:
+        return chunks
+    merged = []
+    buf_texts, buf_start, buf_end = [], chunks[0]["start"], chunks[0]["end"]
+    title, number = chunks[0].get("title", ""), chunks[0].get("number", "1")
+    overlap_buf = []  # texts to prepend as overlap from previous chunk
+
+    for seg in chunks:
+        word_count = sum(len(t.split()) for t in buf_texts)
+        if word_count >= target_words:
+            merged.append({
+                "number": number, "title": title,
+                "start": buf_start, "end": buf_end,
+                "text": " ".join(buf_texts).strip()
+            })
+            # keep last few texts as overlap for next chunk
+            overlap_buf = []
+            running = 0
+            for t in reversed(buf_texts):
+                running += len(t.split())
+                overlap_buf.insert(0, t)
+                if running >= overlap_words:
+                    break
+            buf_texts = list(overlap_buf)
+            buf_start = seg["start"]
+        buf_texts.append(seg["text"])
+        buf_end = seg["end"]
+
+    if buf_texts:
+        merged.append({
+            "number": number, "title": title,
+            "start": buf_start, "end": buf_end,
+            "text": " ".join(buf_texts).strip()
+        })
+    return merged
+
+
 print("="*50)
 print("  Generating Embeddings")
 print("="*50)
@@ -64,15 +103,18 @@ for json_idx, json_file in enumerate(jsons, 1):
         with open(f"jsons/{json_file}") as f:
             content = json.load(f)
         
-        chunk_count = len(content['chunks'])
+        raw_chunks = content['chunks']
+        # Merge small segments into bigger overlapping chunks
+        merged_chunks = merge_segments(raw_chunks, target_words=150, overlap_words=30)
+        chunk_count = len(merged_chunks)
         total_chunks += chunk_count
-        print(f"\n[+] [{json_idx}/{len(jsons)}] {json_file}: {chunk_count} chunks")
+        print(f"\n[+] [{json_idx}/{len(jsons)}] {json_file}: {len(raw_chunks)} segs -> {chunk_count} chunks")
         
         # Create embeddings with optimized batch size
-        texts = [c['text'] for c in content['chunks']]
+        texts = [c['text'] for c in merged_chunks]
         embeddings = create_embedding(texts, batch_size=128)
            
-        for i, chunk in enumerate(content['chunks']):
+        for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
             chunk['embedding'] = embeddings[i]
             chunk_id += 1

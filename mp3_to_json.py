@@ -9,13 +9,18 @@ os.makedirs("jsons", exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using: {device.upper()}")
 
-# Use base model for 3-5x faster transcription
+# Use small model for better accuracy; falls back to base if VRAM is tight
 try:
-    model = whisper.load_model("base", device=device)
+    model = whisper.load_model("small", device=device)
+    print("Loaded 'small' model")
 except Exception as e:
-    print(f"[WARNING] Failed to load 'base' model: {e}")
-    print(f"[INFO] Falling back to 'tiny' model")
-    model = whisper.load_model("tiny", device=device)
+    print(f"[WARNING] Failed to load 'small' model: {e}")
+    try:
+        model = whisper.load_model("base", device=device)
+        print("Loaded 'base' model")
+    except Exception as e2:
+        print(f"[INFO] Falling back to 'tiny' model")
+        model = whisper.load_model("tiny", device=device)
 
 audios = [f for f in os.listdir("audios") if f.endswith('.mp3')]
 existing_jsons = set(os.listdir("jsons"))
@@ -55,9 +60,10 @@ for idx, audio in enumerate(audios, 1):
         result = model.transcribe(
             audio=audio_path,
             language="en",
-            fp16=False,
+            fp16=(device == "cuda"),
             verbose=False,
-            task="transcribe"
+            task="transcribe",
+            condition_on_previous_text=True
         )
         
         # Validate transcription result
