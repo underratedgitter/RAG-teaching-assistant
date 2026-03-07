@@ -1,202 +1,194 @@
 # RAG Teaching Assistant
 
-A local-first Retrieval-Augmented Generation (RAG) desktop app that turns long lecture videos into a searchable Q&A system with timestamp-aware context.
+> **Drop lecture videos in. Ask questions. Get answers with exact timestamps.**
 
-## Why this project
+A fully local desktop app that turns hours of lecture recordings into an AI-powered Q&A system — no cloud, no API keys, no subscriptions. Just your GPU doing the work.
 
-Long educational videos are useful, but finding one specific concept later is slow. This project solves that by converting lecture content into semantically searchable chunks and generating answers grounded in retrieved transcript context.
+---
+
+## The Problem
+
+You recorded 10 hours of lectures. Now you need to find where the professor explained "backpropagation." Good luck scrubbing through video timelines.
+
+## The Solution
+
+This app watches your lectures so you don't have to (again). Upload videos, let it transcribe and index everything, then ask questions in plain English. It'll point you to the exact video and timestamp.
+
+```
+You:  "How does gradient descent work?"
+App:  "In Video 2 at 14:30, the instructor explains that gradient descent
+       iteratively adjusts parameters by computing partial derivatives..."
+```
+
+---
+
+## How It Works
+
+```text
+ Upload Videos ──> Extract Audio ──> Transcribe ──> Build Index ──> Ask Away!
+     MP4             MP3            Chunks+Time     Embeddings      AI Answers
+```
+
+1. **Upload** lecture videos through the desktop UI
+2. **Process** — the pipeline converts, transcribes, and indexes automatically
+3. **Ask** — type a question, get an answer grounded in your actual lecture content
+
+---
 
 ## Key Features
 
-- Upload multiple videos from the desktop UI
-- Convert videos to MP3 in parallel using FFmpeg
-- Transcribe audio to timestamped chunks with Whisper
-- Build semantic embeddings locally via Ollama
-- Retrieve top relevant chunks by cosine similarity
-- Generate concise answers with video/timestamp context
-- Run fully local (no external hosted LLM required)
+- **100% Local** — runs entirely on your machine, no data leaves your PC
+- **GPU Accelerated** — CUDA-powered Whisper transcription with fp16 for speed
+- **Smart Chunking** — overlapping text segments for better context retrieval
+- **Timestamp References** — every answer points back to video + time
+- **Fast Retrieval** — precomputed embeddings + cosine similarity in milliseconds
+- **Model Pre-warming** — first query is fast, no cold start penalty
 
-## Architecture Overview
-
-```text
-Videos -> Audio Extraction -> Transcription -> Embedding Index -> Retrieval -> Answer Generation
- MP4        MP3                JSON chunks      Vector cache      Top-K        Final response
-```
+---
 
 ## Tech Stack
 
-- **UI**: Tkinter (`dashboard.py`)
-- **Video -> Audio**: FFmpeg (`video_to_mp3.py`)
-- **Speech-to-Text**: OpenAI Whisper + PyTorch (`mp3_to_json.py`)
-- **Embeddings + LLM**: Ollama (`preprocess_json.py`, `dashboard.py`)
-- **Embedding model**: `nomic-embed-text`
-- **Generation model**: `qwen2.5:1.5b`
-- **Retrieval math**: scikit-learn cosine similarity
-- **Data & persistence**: pandas, numpy, joblib, JSON
+| Component | Tool | File |
+|-----------|------|------|
+| Desktop UI | Tkinter | `dashboard.py` |
+| Video → Audio | FFmpeg (parallel) | `video_to_mp3.py` |
+| Speech → Text | OpenAI Whisper (`small`) | `mp3_to_json.py` |
+| Text → Vectors | Ollama + `nomic-embed-text` | `preprocess_json.py` |
+| Question → Answer | Ollama + `qwen2.5:1.5b` | `dashboard.py` |
+| Similarity Search | scikit-learn cosine similarity | `dashboard.py` |
+| Data Storage | pandas, numpy, joblib | `preprocess_json.py` |
 
 ## Project Structure
 
-```text
-.
-├── dashboard.py               # Tkinter app + orchestration + query answering
-├── video_to_mp3.py           # Batch/parallel video->audio conversion
-├── mp3_to_json.py            # Whisper transcription to chunked JSON
-├── preprocess_json.py        # Embedding generation + cache creation
-├── requirements.txt
-├── embeddings.joblib         # Generated embedding dataframe cache
-├── embedding_matrix.npy      # Generated float32 matrix for fast similarity
-├── videos/                   # Input videos
-├── audios/                   # Intermediate MP3 files
-└── jsons/                    # Transcript JSON outputs
+```
+dashboard.py            # The brain — UI, orchestration, Q&A
+video_to_mp3.py         # Rips audio from videos (parallel)
+mp3_to_json.py          # Whisper transcription → timestamped chunks
+preprocess_json.py      # Chunk merging + embedding generation
+requirements.txt        # Python dependencies
 ```
 
-## End-to-End Pipeline (Detailed)
+Generated at runtime:
+```
+videos/                 # Your uploaded videos
+audios/                 # Extracted MP3 files
+jsons/                  # Transcript JSONs
+embeddings.joblib       # Searchable embedding database
+embedding_matrix.npy    # Precomputed similarity matrix
+```
 
-### 1) App startup and workspace prep (`dashboard.py`)
+---
 
-- Creates/ensures `videos/`, `audios/`, and `jsons/`
-- Clears previous working files and embedding cache on launch
-- Loads existing embedding artifacts if present
-- Starts desktop UI for upload, processing, and Q&A
+## Pipeline Deep Dive
 
-### 2) Video upload (`dashboard.py`)
+### 1) App startup (`dashboard.py`)
 
-- User selects video files through a file dialog
-- Files are copied into `videos/`
-- UI status updates with current video count and index status
+Clears previous working data, loads any cached embeddings, fires up the GUI, and pre-warms both Ollama models in the background so your first query is instant.
 
-### 3) Processing pipeline (`dashboard.py` triggers 3 scripts)
+### 2) Upload videos
 
-#### Step 3.1: Video -> MP3 (`video_to_mp3.py`)
+Drag in your `.mp4`, `.avi`, `.mkv`, or `.mov` files. They're copied to `videos/`.
 
-- Scans `videos/` for supported formats (`.mp4`, `.avi`, `.mkv`, `.mov`)
-- Converts each file with FFmpeg:
-	- `-vn` removes video stream
-	- `-acodec libmp3lame` uses MP3 encoder
-	- `-q:a 4` quality setting
-	- `-threads 0` lets FFmpeg use all cores
-- Uses `ThreadPoolExecutor` (up to 4 workers) for parallel conversion
-- Stores outputs in `audios/` as `1_filename.mp3`, `2_filename.mp3`, etc.
+### 3) Processing (one click, three stages)
 
-#### Step 3.2: MP3 -> transcript chunks (`mp3_to_json.py`)
+#### Stage 1: Video → Audio (`video_to_mp3.py`)
+FFmpeg strips the audio track. Up to 4 videos convert in parallel.
 
-- Detects device (`cuda` if available, otherwise CPU)
-- Loads Whisper `base` model (fallback to `tiny` on failure)
-- Transcribes each audio file with language set to English
-- Extracts robust chunk records per segment:
-	- `number`, `title`, `start`, `end`, `text`
-- Skips empty/malformed segments safely
-- Saves per-audio JSON output in `jsons/` as `audio_name.mp3.json`
+#### Stage 2: Audio → Text (`mp3_to_json.py`)
+Whisper `small` model transcribes with GPU acceleration (`fp16` on CUDA).
+Each segment gets a timestamp. `condition_on_previous_text` keeps transcriptions coherent across long lectures.
 
-#### Step 3.3: Transcript -> embeddings (`preprocess_json.py`)
+#### Stage 3: Text → Embeddings (`preprocess_json.py`)
+Small Whisper segments are merged into ~150-word overlapping chunks (30-word overlap) so retrieval captures full ideas, not sentence fragments. Each chunk is embedded via `nomic-embed-text` in batches of 128.
 
-- Reads all transcript JSON files from `jsons/`
-- Embeds chunk text via Ollama `/api/embed` with `nomic-embed-text`
-- Uses batched embedding requests (`batch_size=128`) for throughput
-- Includes retry + fallback behavior on request failure
-- Builds unified dataframe and stores:
-	- `embeddings.joblib` (records + vectors)
-	- `embedding_matrix.npy` (precomputed `float32` matrix)
+### 4) Ask a question
 
-### 4) Question answering flow (`dashboard.py`)
+1. Your question is embedded with `nomic-embed-text`
+2. Cosine similarity finds the **top 8** most relevant chunks
+3. Low-relevance results are filtered out (threshold > 0.3)
+4. A structured prompt with readable timestamps is sent to `qwen2.5:1.5b`
+5. You get a grounded answer with exact video + timestamp references
 
-When a user asks a question:
+---
 
-1. Embed the question with `nomic-embed-text`
-2. Compute cosine similarity against precomputed chunk matrix
-3. Select top-5 most relevant chunks
-4. Construct context prompt from retrieved chunk metadata
-5. Generate concise answer via Ollama `/api/generate` using `qwen2.5:1.5b`
-6. Show response in UI with source-aware context
+## Ollama Models
 
-## Ollama Models Used
+| Model | Role | Why |
+|-------|------|-----|
+| `nomic-embed-text` | Embedding | Converts text to vectors for semantic search |
+| `qwen2.5:1.5b` | Generation | Small, fast LLM that fits in ~2GB VRAM |
 
-- **`nomic-embed-text`**
-	- Used for both document chunk embeddings and query embeddings
-	- Enables semantic retrieval (meaning-based search)
+---
 
-- **`qwen2.5:1.5b`**
-	- Used for final answer generation from retrieved context
-	- Chosen for lightweight local inference and responsiveness
+## Performance
 
-## Performance Optimizations Implemented
+> Designed to run well on a laptop GPU (tested on RTX 3050 4GB).
 
-- Parallel video conversion with bounded worker pool
-- GPU-aware Whisper transcription (`cuda` when available)
-- Batched embedding calls to reduce HTTP overhead
-- HTTP connection pooling + retry logic in embedding stage
-- Precomputed `float32` embedding matrix for faster similarity search
-- Persistent artifact caching (`joblib` + `.npy`)
-- Threaded processing in UI so app remains responsive
+- **Parallel conversion** — FFmpeg processes up to 4 videos simultaneously
+- **fp16 inference** — halves Whisper's GPU memory and doubles speed
+- **Smart chunking** — overlapping 150-word chunks beat tiny sentence fragments for retrieval
+- **Batch embeddings** — 128 chunks per API call instead of one-by-one
+- **Precomputed matrix** — similarity search runs in milliseconds, not seconds
+- **Model pre-warming** — both models loaded on startup, zero cold-start lag
+- **Connection pooling** — HTTP sessions reused across all Ollama calls
+- **Threaded UI** — processing never freezes the interface
 
-## Setup
+---
 
-### 1) Install Python dependencies
+## Quick Start
 
 ```bash
+# 1. Install dependencies
 pip install -r requirements.txt
-```
 
-### 2) Ensure FFmpeg is installed and available in PATH
-
-```bash
+# 2. Make sure FFmpeg is in PATH
 ffmpeg -version
-```
 
-### 3) Start Ollama
-
-```bash
+# 3. Start Ollama
 ollama serve
-```
 
-### 4) Pull required models (first time only)
-
-```bash
+# 4. Pull models (first time only)
 ollama pull nomic-embed-text
 ollama pull qwen2.5:1.5b
-```
 
-## Run the App
-
-```bash
+# 5. Launch
 python dashboard.py
 ```
 
+---
+
 ## Usage
 
-1. Click **Upload Videos** and select lecture files
-2. Click **Process Videos**
-	 - Step 1: convert to MP3
-	 - Step 2: transcribe to JSON chunks
-	 - Step 3: generate embedding index
-3. Enter your question and click **Ask**
-4. Read generated answer in the response panel
+1. **Upload Videos** — click the button, select your lecture files
+2. **Process Videos** — one click kicks off the full pipeline
+3. **Ask Questions** — type naturally, hit Enter or click Ask
+4. **Read the Answer** — complete with video number and timestamp
 
-## Data Artifacts
+---
 
-- `jsons/*.json`: chunked transcript files with timestamps
-- `embeddings.joblib`: dataframe including text + metadata + embeddings
-- `embedding_matrix.npy`: dense matrix used for fast similarity matching
+## Requirements
 
-## Notes
+- Python 3.10+
+- FFmpeg installed and in PATH
+- [Ollama](https://ollama.com/) running locally
+- NVIDIA GPU recommended (works on CPU, just slower)
 
-- The current startup flow clears prior videos/audios/jsons/cache each run for a fresh processing cycle.
-- Keep Ollama running while asking questions.
-- First-time model pulls may take several minutes depending on network speed.
+---
 
 ## Troubleshooting
 
-- **Cannot connect to Ollama**
-	- Start server: `ollama serve`
-	- Verify endpoint: `http://localhost:11434`
+| Problem | Fix |
+|---------|-----|
+| Can't connect to Ollama | Run `ollama serve` first |
+| No embeddings / no answers | Re-process videos from dashboard |
+| FFmpeg not found | Install FFmpeg and add to PATH |
+| First query is slow | Wait for "Models warmed up" in terminal |
 
-- **No embeddings / no answers**
-	- Re-run full pipeline from dashboard
-	- Check if `embeddings.joblib` and `embedding_matrix.npy` were created
+---
 
-- **FFmpeg conversion fails**
-	- Confirm FFmpeg installation and PATH setup
-	- Try `ffmpeg -version` in terminal
+## License
+
+MIT
 
 - **Slow transcription**
 	- Use GPU-enabled PyTorch + CUDA where available

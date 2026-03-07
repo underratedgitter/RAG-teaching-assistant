@@ -103,9 +103,10 @@ What happens:
 
 Tools used:
   - Whisper (OpenAI) - Speech-to-text AI model
-      • Model: base (faster) or tiny (fallback)
+      • Model: small (accurate) → base (fallback) → tiny (fallback)
       • language="en"    : English transcription
-      • fp16=False       : Precision mode
+      • fp16=True on CUDA: Half-precision for ~2x faster GPU inference
+      • condition_on_previous_text=True : Uses prior context for coherence
   - PyTorch - Deep learning framework (GPU/CPU)
       • CUDA for GPU acceleration
   - json - Saving transcription data
@@ -138,10 +139,12 @@ STEP 3: Text → Vector Embeddings (preprocess_json.py)
 
 What happens:
   1. Loads all JSON files
-  2. Extracts text from each chunk
-  3. Converts text to 768-dimensional vectors (embeddings)
-  4. Creates searchable database
-  5. Saves embeddings for fast retrieval
+  2. Merges small Whisper segments into larger overlapping chunks
+     (~150 words per chunk with 30-word overlap for context continuity)
+  3. Extracts text from each merged chunk
+  4. Converts text to 768-dimensional vectors (embeddings)
+  5. Creates searchable database
+  6. Saves embeddings for fast retrieval
 
 Tools used:
   - Ollama - Local LLM server
@@ -177,7 +180,8 @@ What happens when you ask a question:
 2. Semantic Search
    - Compare question vector with all chunk vectors
    - Calculate cosine similarity scores
-   - Find top 5 most relevant chunks
+   - Find top 8 most relevant chunks
+   - Filter out low-similarity results (threshold > 0.3)
    
 3. Generate Answer
    - Send relevant chunks + question to AI
@@ -190,8 +194,9 @@ Tools used:
       • Range: 0 (unrelated) to 1 (identical)
   - Ollama - Answer generation
       • Model: qwen2.5:1.5b - Language model
-      • temperature: 0.3  - Focused responses
-      • num_predict: 100  - Max 100 tokens
+      • temperature: 0.2  - Focused, accurate responses
+      • num_predict: 300  - Up to 300 tokens for thorough answers
+      • top_p: 0.9        - Nucleus sampling for quality
 
 Example Flow:
   Question: "What is machine learning?"
@@ -238,15 +243,20 @@ Example Flow:
 ================================================================================
 
 1.  Parallel Video Conversion    - 4 videos at once using ThreadPoolExecutor
-2.  Base Whisper Model            - 3-5x faster than larger models
-3.  GPU Acceleration              - CUDA for Whisper transcription
-4.  Batch Embeddings              - 128 chunks per request
-5.  Pre-computed Matrix           - Similarity search in milliseconds
-6.  Float32 Precision             - 50% less memory than float64
-7.  Compressed Storage            - joblib with compression level 3
-8.  Connection Pooling            - Reuses HTTP connections to Ollama
-9.  Retry Logic                   - Auto-retry failed API calls
-10. Cache Cleanup                 - Clears old data on startup
+2.  Small Whisper Model           - Better accuracy than base, with fallback chain
+3.  FP16 on CUDA                  - Half-precision for ~2x faster GPU transcription
+4.  Contextual Transcription      - condition_on_previous_text for coherence
+5.  Overlapping Chunk Merging     - ~150 words with 30-word overlap for context
+6.  GPU Acceleration              - CUDA for Whisper transcription
+7.  Batch Embeddings              - 128 chunks per request
+8.  Pre-computed Matrix           - Similarity search in milliseconds
+9.  Float32 Precision             - 50% less memory than float64
+10. Compressed Storage            - joblib with compression level 3
+11. Connection Pooling            - Reuses HTTP connections to Ollama
+12. Retry Logic                   - Auto-retry failed API calls
+13. Model Pre-warming             - Loads models into GPU on startup
+14. Similarity Threshold          - Filters out low-relevance chunks (>0.3)
+15. Cache Cleanup                 - Clears old data on startup
 
 
 ================================================================================
