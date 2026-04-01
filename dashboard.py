@@ -12,7 +12,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-
+# RAG Teaching Assistant Dashboard Interface
 class RAGDashboard:
     def __init__(self, root):
         self.root = root
