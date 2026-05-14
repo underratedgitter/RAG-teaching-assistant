@@ -6,6 +6,7 @@ import shutil
 import threading
 import subprocess
 import sys
+import time
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import joblib
@@ -20,38 +21,57 @@ class RAGDashboard:
         self.root.title("RAG Teaching Assistant")
         self.root.geometry("700x650")
         
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.videos_dir = os.path.join(self.base_dir, "videos")
-        self.audios_dir = os.path.join(self.base_dir, "audios")
-        self.jsons_dir = os.path.join(self.base_dir, "jsons")
-        os.makedirs(self.videos_dir, exist_ok=True)
-        os.makedirs(self.audios_dir, exist_ok=True)
-        os.makedirs(self.jsons_dir, exist_ok=True)
-        self._clear_work_dirs_on_start()
-        
-        self.df = None
-        self.embedding_matrix = None
-        self.load_embeddings()
-        
-        # Reusable HTTP session with connection pooling
-        self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2)
-        self.session.mount('http://', adapter)
-        
-        self.create_ui()
-        
-        # Pre-warm Ollama models in background so first query is fast
-        threading.Thread(target=self._warm_models, daemon=True).start()
+        try:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.videos_dir = os.path.join(self.base_dir, "videos")
+            self.audios_dir = os.path.join(self.base_dir, "audios")
+            self.jsons_dir = os.path.join(self.base_dir, "jsons")
+            
+            # Create directories with error handling
+            for dir_path in [self.videos_dir, self.audios_dir, self.jsons_dir]:
+                try:
+                    os.makedirs(dir_path, exist_ok=True)
+                except Exception as e:
+                    print(f"Warning: Could not create {dir_path}: {e}")
+            
+            self._clear_work_dirs_on_start()
+            
+            self.df = None
+            self.embedding_matrix = None
+            self.load_embeddings()
+            
+            # Reusable HTTP session with connection pooling
+            self.session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2)
+            self.session.mount('http://', adapter)
+            
+            self.create_ui()
+            
+            # Auto-start Ollama if not running
+            threading.Thread(target=self._ensure_ollama_running, daemon=True).start()
+            
+            # Pre-warm Ollama models in background so first query is fast
+            threading.Thread(target=self._warm_models, daemon=True).start()
+            
+        except Exception as e:
+            print(f"Error during initialization: {e}")
+            self.create_ui()  # Still create UI so app doesn't crash
 
     def _clear_work_dirs_on_start(self):
         """Remove all videos, audios, jsons, and embedding cache on launch."""
         dirs = [self.videos_dir, self.audios_dir, self.jsons_dir]
         for path in dirs:
             try:
-                for name in os.listdir(path):
-                    file_path = os.path.join(path, name)
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
+                if os.path.exists(path):
+                    for name in os.listdir(path):
+                        file_path = os.path.join(path, name)
+                        try:
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                            elif os.path.isdir(file_path):
+                                shutil.rmtree(file_path)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -121,17 +141,56 @@ class RAGDashboard:
         self.update_status()
         self.log("Ready. Upload videos and click 'Process Videos' to start.")
         
+    def _ensure_ollama_running(self):
+        """Check if Ollama is running, if not start it automatically."""
+        max_attempts = 30  # Try for 30 seconds
+        attempt = 0
+        ollama_started = False
+        
+        while attempt < max_attempts:
+            try:
+                # Try to connect to Ollama
+                response = self.session.get("http://localhost:11434/api/tags", timeout=2)
+                if response.status_code == 200:
+                    self.log_safe("✓ Connected to Ollama server")
+                    return True
+            except Exception:
+                pass
+            
+            attempt += 1
+            if attempt == 1:
+                self.log_safe("⏳ Ollama not detected. Attempting to start Ollama...")
+                try:
+                    # Start Ollama in background
+                    subprocess.Popen("ollama serve", shell=True, 
+                                   stdout=subprocess.DEVNULL, 
+                                   stderr=subprocess.DEVNULL)
+                    ollama_started = True
+                except Exception as e:
+                    self.log_safe(f"⚠ Could not auto-start Ollama: {str(e)}")
+            
+            time.sleep(1)
+        
+        if ollama_started:
+            self.log_safe("⚠ Ollama started but not ready yet. Please try processing after a moment.")
+        else:
+            self.log_safe("⚠ Ollama not responding. Make sure Ollama is installed and run: ollama serve")
+        return False
+    
     def _warm_models(self):
         """Pre-warm Ollama models to avoid cold-start latency."""
         try:
+            # Wait a bit for Ollama to be ready
+            time.sleep(2)
+            
             self.session.post("http://localhost:11434/api/embed",
                 json={"model": "nomic-embed-text", "input": ["warmup"]}, timeout=30)
             self.session.post("http://localhost:11434/api/generate",
                 json={"model": "qwen2.5:1.5b", "prompt": "hi", "stream": False,
                       "options": {"num_predict": 1}}, timeout=30)
-            self.log_safe("Models warmed up - ready for queries.")
-        except Exception:
-            pass
+            self.log_safe("✓ Ollama models warmed up - ready for queries.")
+        except Exception as e:
+            self.log_safe(f"⚠ Model warm-up in progress... (this is normal)")
 
     def log(self, text):
         """Add text to terminal"""
@@ -146,23 +205,46 @@ class RAGDashboard:
         self.terminal.delete("1.0", "end")
         
     def load_embeddings(self):
+        """Load cached embeddings with robust error handling"""
         embeddings_path = os.path.join(self.base_dir, "embeddings.joblib")
         matrix_path = os.path.join(self.base_dir, "embedding_matrix.npy")
         
-        if os.path.exists(embeddings_path):
-            try:
-                self.df = joblib.load(embeddings_path)
-                if os.path.exists(matrix_path):
-                    self.embedding_matrix = np.load(matrix_path)
-                else:
-                    self.embedding_matrix = np.vstack(self.df['embedding'].values)
-            except:
-                self.df = None
+        try:
+            if os.path.exists(embeddings_path):
+                try:
+                    self.df = joblib.load(embeddings_path)
+                    if os.path.exists(matrix_path):
+                        try:
+                            self.embedding_matrix = np.load(matrix_path)
+                        except Exception as e:
+                            # Regenerate if matrix is corrupted
+                            self.embedding_matrix = np.vstack(self.df['embedding'].values)
+                    else:
+                        self.embedding_matrix = np.vstack(self.df['embedding'].values)
+                except Exception as e:
+                    self.df = None
+                    self.embedding_matrix = None
+                    # Silent fail - embeddings will be regenerated when videos are processed
+        except Exception as e:
+            self.df = None
+            self.embedding_matrix = None
                 
     def update_status(self):
-        videos = len([f for f in os.listdir(self.videos_dir) if f.endswith(('.mp4','.avi','.mkv','.mov'))])
-        chunks = len(self.df) if self.df is not None else 0
-        self.status_label.config(text=f"{videos} videos | {chunks} chunks indexed")
+        """Update status label with error handling"""
+        try:
+            videos = 0
+            chunks = 0
+            
+            try:
+                if os.path.exists(self.videos_dir):
+                    videos = len([f for f in os.listdir(self.videos_dir) if f.endswith(('.mp4','.avi','.mkv','.mov'))])
+            except Exception:
+                videos = 0
+            
+            chunks = len(self.df) if self.df is not None else 0
+            self.status_label.config(text=f"{videos} videos | {chunks} chunks indexed")
+        except Exception:
+            self.status_label.config(text="Ready")
         
     def upload_videos(self):
         files = filedialog.askopenfilenames(
@@ -331,6 +413,16 @@ Instructions:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = RAGDashboard(root)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = RAGDashboard(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        # Try to show error in GUI
+        try:
+            import tkinter.messagebox as messagebox
+            messagebox.showerror("Error", f"Application error: {e}\n\nCheck that all dependencies are installed:\npip install -r requirements.txt")
+        except:
+            print(f"Could not display error dialog: {e}")
+        sys.exit(1)
