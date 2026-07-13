@@ -82,7 +82,7 @@ class RAGDashboard:
                     os.remove(cache_path)
             except Exception:
                 pass
-        
+
     def create_ui(self):
         # Video section
         tk.Label(self.root, text="1. Video Management").pack(anchor="w", padx=10, pady=(10,5))

@@ -1,0 +1,842 @@
+
+================================================================================
+        RAG TEACHING ASSISTANT  -  COMPLETE PROJECT BLUEPRINT
+================================================================================
+        A locally-running AI that turns lecture videos into a searchable
+        Q&A system. No cloud. No API keys. No subscriptions.
+================================================================================
+
+  SECTION 1   WHAT IS THIS PROJECT?
+________________________________________________________________________________
+
+  You record 10 hours of lectures. Later you need to find where "backpropagation"
+  was explained. Instead of scrubbing timelines for hours, you type the question
+  and the app tells you:
+
+        "In Video 2 at 14:30, the instructor explains that gradient descent
+         iteratively adjusts parameters by computing partial derivatives..."
+
+  Everything runs 100% on your own machine.  Your data never leaves your PC.
+
+
+
+
+  SECTION 2   REPOSITORY LAYOUT
+________________________________________________________________________________
+
+  RAG Based Teaching AI Assistant/
+  |
+  |   run.bat                     One-click Windows launcher
+  |   .venv/                      Python virtual environment
+  |   .vscode/                    VS Code editor settings
+  |
+  +-- RAG-teaching-assistant/     The application lives here
+      |
+      |   dashboard.py            MAIN BRAIN  -  UI + Q&A logic  (429 lines)
+      |   video_to_mp3.py         Stage 1: Video to Audio         (51 lines)
+      |   mp3_to_json.py          Stage 2: Audio to Transcript    (132 lines)
+      |   preprocess_json.py      Stage 3: Text to Embeddings     (152 lines)
+      |   requirements.txt        Python package list
+      |   README.md               Project documentation
+      |
+      |   videos/                 Uploaded MP4 / AVI / MKV / MOV files
+      |   audios/                 Extracted MP3 audio files
+      |   jsons/                  Whisper transcription JSON files
+      |
+      |   embeddings.joblib       Pandas DataFrame  (chunks + vectors)
+      +-- embedding_matrix.npy    Precomputed float32 matrix for fast search
+
+
+
+
+  SECTION 3   HOW THE PIPELINE WORKS  (Big Picture)
+________________________________________________________________________________
+
+  User uploads video
+        |
+        v
+  Stage 1   video_to_mp3.py
+            FFmpeg strips the audio track
+            Up to 4 videos convert in parallel
+        |
+        v
+  Stage 2   mp3_to_json.py
+            OpenAI Whisper transcribes speech to text
+            Every word gets a start/end timestamp
+            GPU accelerated with fp16 for speed
+        |
+        v
+  Stage 3   preprocess_json.py
+            Small Whisper segments are merged into 150-word chunks
+            Each chunk overlaps the previous by 30 words
+            Every chunk is converted to a 768-number vector (embedding)
+            Saved to disk as embeddings.joblib + embedding_matrix.npy
+        |
+        v
+  User types a question
+        |
+        v
+  dashboard.py  (Q&A engine)
+            Question is converted to a 768-number vector
+            Cosine similarity finds the 8 most relevant chunks
+            Chunks below 0.3 similarity are filtered out
+            A structured prompt is sent to the local LLM
+        |
+        v
+  Answer displayed
+            "In Video 2 at 14:30..."
+
+
+
+
+  SECTION 4   ENTRY POINT  -  run.bat
+________________________________________________________________________________
+
+  Contents of run.bat  (3 lines only):
+
+        @echo off
+        python "C:\...\RAG-teaching-assistant\dashboard.py"
+        pause
+
+  Line 1   @echo off
+           Stops the terminal from printing the command itself before running it.
+
+  Line 2   python "absolute\path\dashboard.py"
+           Absolute path is used because run.bat sits one folder above the app.
+           A relative path would fail from that location.
+
+  Line 3   pause
+           Keeps the terminal window open after the app closes so you can
+           read any error messages printed to the console.
+
+
+
+
+  SECTION 5   dashboard.py  -  THE BRAIN
+________________________________________________________________________________
+
+  This is the only file the user directly interacts with.
+  It has four responsibilities:
+
+        1.  Build and display the graphical user interface
+        2.  Orchestrate the three-stage processing pipeline
+        3.  Handle all question and answer logic
+        4.  Manage the Ollama AI server lifecycle
+
+
+  5.1  IMPORTS AND WHAT EACH ONE DOES
+  ....................................................................
+
+        tkinter              Desktop GUI framework (built into Python)
+        filedialog           Native OS file picker dialog
+        messagebox           Native OS popup dialogs for warnings and errors
+        os / shutil          File system: create folders, copy files, delete files
+        threading            Run heavy tasks in background so the UI never freezes
+        subprocess           Launch other programs: FFmpeg, Python scripts, Ollama
+        sys                  Access sys.executable (the exact Python being used)
+        time                 time.sleep() for Ollama startup delays
+        cosine_similarity    The math engine for finding similar chunks
+        numpy                Fast array operations, saves/loads .npy files
+        joblib               Saves and loads Python objects like DataFrames
+        requests             Makes HTTP calls to Ollama's local REST API
+        HTTPAdapter          Manages a pool of reusable TCP connections
+        Retry                Automatically retries failed HTTP requests
+
+
+  5.2  STARTUP SEQUENCE  (what happens the moment you launch the app)
+  ....................................................................
+
+        Step 1   Resolve base_dir
+                 os.path.dirname(os.path.abspath(__file__))
+                 Gets the folder where dashboard.py lives, regardless of
+                 where Python was called from.
+
+        Step 2   Create working folders
+                 videos/, audios/, jsons/ are created if they don't exist.
+                 exist_ok=True prevents errors if folders already exist.
+
+        Step 3   Wipe everything clean
+                 _clear_work_dirs_on_start() deletes all files inside
+                 videos/, audios/, jsons/ and removes embeddings.joblib
+                 and embedding_matrix.npy from disk.
+                 This happens every single launch - intentional design.
+                 Ensures you never work with stale data from a past session.
+
+        Step 4   Try to load cached embeddings
+                 Even though we just wiped them, load_embeddings() is called.
+                 On first launch it finds nothing. After processing, this
+                 populates self.df and self.embedding_matrix in memory.
+
+        Step 5   Create HTTP connection pool
+                 requests.Session() with HTTPAdapter(pool_connections=2,
+                 pool_maxsize=2) creates a persistent pool of TCP connections
+                 to Ollama. Reusing connections is faster than opening new
+                 ones for every single API call.
+
+        Step 6   Build the GUI
+                 create_ui() draws all the buttons, labels, and text boxes.
+
+        Step 7   Start two background threads (both daemon=True)
+                 Thread A  -  _ensure_ollama_running
+                 Thread B  -  _warm_models
+                 daemon=True means they die automatically when the app closes.
+                 No cleanup needed, no zombie processes.
+
+
+  5.3  GRAPHICAL USER INTERFACE LAYOUT
+  ....................................................................
+
+        +----------------------------------------------------------+
+        |  1. Video Management                                     |
+        |  [ Upload Videos ]  [ Process Videos ]  [ Open Folder ] |
+        |  [ Clear Terminal ]                                      |
+        |  Status: 2 videos  |  347 chunks indexed                |
+        +----------------------------------------------------------+
+        |  2. Ask Question                                         |
+        |  [ type your question here .................... ] [ Ask ]|
+        +----------------------------------------------------------+
+        |  Response:                                               |
+        |  +----------------------------------------------------+  |
+        |  |  AI answer appears here  (8 lines tall, scrollable)|  |
+        |  +----------------------------------------------------+  |
+        +----------------------------------------------------------+
+        |  Terminal Output:                                        |
+        |  +----------------------------------------------------+  |
+        |  |  black background  /  lime green text              |  |
+        |  |  Consolas font  /  live streaming log output       |  |
+        |  +----------------------------------------------------+  |
+        +----------------------------------------------------------+
+
+  Pressing Enter in the question box is the same as clicking Ask.
+  The terminal auto-scrolls to the bottom as new lines arrive.
+
+
+  5.4  OLLAMA AUTO-START  (_ensure_ollama_running)
+  ....................................................................
+
+        Runs in background. Polls http://localhost:11434/api/tags every 1 second.
+        Port 11434 is Ollama's default local API port.
+
+        If Ollama is already running     ->  logs a success tick and exits
+        If not running on first attempt  ->  launches  "ollama serve"  silently
+                                             (no output shown from Ollama itself)
+        Retries up to 30 times (30 seconds total)
+        If still not responding after 30s -> logs a warning and gives up
+
+
+  5.5  MODEL PRE-WARMING  (_warm_models)
+  ....................................................................
+
+        Runs in background. Waits 2 seconds first (lets Ollama start up).
+
+        Then sends two tiny dummy requests:
+
+        Request 1  ->  POST /api/embed  with input: ["warmup"]
+                       Forces nomic-embed-text to load into GPU memory
+
+        Request 2  ->  POST /api/generate  with prompt: "hi", num_predict: 1
+                       Forces qwen2.5:1.5b to load into GPU memory
+                       num_predict:1 means only generate 1 token  (fast warmup)
+
+        After both complete, both models are resident in VRAM.
+        Your first real question gets answered at full speed, no cold-start.
+
+
+  5.6  THREAD-SAFE LOGGING  (log vs log_safe)
+  ....................................................................
+
+        log(text)
+             Inserts text into the terminal widget directly.
+             MUST only be called from the main thread.
+
+        log_safe(text)
+             Schedules log() to run on the main thread via root.after(0, ...).
+             Safe to call from any background thread.
+             after(0, ...) means "run this as soon as the event loop is free."
+
+        This is the standard Tkinter pattern for thread-safe UI updates.
+        Tkinter is single-threaded  -  all widget changes must happen on
+        the main thread or the app crashes.
+
+
+  5.7  VIDEO UPLOAD
+  ....................................................................
+
+        Opens the native OS file picker filtered to mp4, avi, mkv, mov.
+        For each selected file it calls shutil.copy2(source, destination).
+        copy2 copies the file AND preserves its original timestamps.
+        If the file already exists in videos/ it is skipped (no duplicates).
+
+
+  5.8  PROCESSING PIPELINE TRIGGER
+  ....................................................................
+
+        When Process Videos is clicked:
+          1. Check that at least one video exists in videos/ folder
+          2. Disable both  Process Videos  and  Ask  buttons
+             (prevents double-clicks and concurrent runs)
+          3. Clear the terminal output
+          4. Start _process() in a new daemon background thread
+
+
+  5.9  HOW CHILD SCRIPTS ARE LAUNCHED  (run_script)
+  ....................................................................
+
+        subprocess.Popen(
+            [sys.executable, script_name],
+            cwd = self.base_dir,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            text = True,
+            bufsize = 1
+        )
+
+        sys.executable    Uses the exact same Python binary as the parent.
+                          Guarantees the same virtual environment and installed
+                          packages are used in the child script.
+
+        cwd               Sets the working directory to where dashboard.py lives
+                          so that relative paths like  videos/  and  audios/
+                          inside the child scripts resolve correctly.
+
+        stderr=STDOUT     Merges error output and standard output into one stream
+                          so all output appears together in the terminal.
+
+        bufsize=1         Line-buffered mode. Each print() in the child script
+                          appears in the UI terminal immediately, not batched.
+
+        The loop reads every line and passes it to log_safe() for real-time display.
+        Returns True on exit code 0 (success), False otherwise.
+
+
+  5.10  THE Q&A ENGINE  (_answer)
+  ....................................................................
+
+        Called in a background thread each time the user submits a question.
+        Four steps:
+
+        STEP A  -  Embed the question
+             POST http://localhost:11434/api/embed
+             Model: nomic-embed-text
+             Input: [the question text]
+             Output: one vector of 768 floating-point numbers
+
+        STEP B  -  Find the most relevant chunks
+             Load embedding_matrix  (shape: total_chunks x 768)
+             Compute cosine similarity between question vector and every row
+             Result: one similarity score per chunk  (value between -1 and 1)
+             Sort scores descending, take top 8 indices
+             Filter: remove any chunk with similarity below 0.3
+             If all chunks are below 0.3, fall back to top 3 anyway
+
+        STEP C  -  Format the context
+             For each selected chunk, build a readable block:
+
+                  [Video 2: LectureName  |  14:30 - 16:45]
+                  ...the transcribed text from this section...
+
+             divmod(seconds, 60) converts raw seconds to MM:SS format
+             :02d zero-pads single-digit seconds  (5 becomes 05)
+
+        STEP D  -  Generate the answer
+             Build a structured prompt:
+
+                  You are a teaching assistant. Answer using ONLY the
+                  lecture transcript excerpts below.
+
+                  --- LECTURE EXCERPTS ---
+                  [Video 2: LectureName | 14:30-16:45]
+                  ... text ...
+                  --- END EXCERPTS ---
+
+                  Student Question: {question}
+
+                  Instructions:
+                  - Answer based strictly on the provided excerpts
+                  - Reference the video number and timestamp
+                  - If excerpts don't contain enough info, say so
+                  - Be concise but thorough
+
+             POST http://localhost:11434/api/generate
+             Model: qwen2.5:1.5b
+             stream: false         (wait for complete response before displaying)
+             num_predict: 300      (maximum output tokens)
+             num_gpu: 99           (use all available GPU layers)
+             temperature: 0.2     (near-deterministic, factual, not creative)
+             top_p: 0.9           (sample only from top 90% probability mass)
+
+        Error handling covers three cases:
+             Timeout          -> Ollama took too long to respond
+             ConnectionError  -> Ollama is not running
+             Any other error  -> shown as a user-friendly message in the response box
+
+
+
+
+  SECTION 6   video_to_mp3.py  -  STAGE 1
+________________________________________________________________________________
+
+  Converts every video in videos/ into an MP3 file in audios/.
+
+  6.1  SMART SKIP
+  ....................................................................
+
+        existing_audios = set(os.listdir("audios"))
+        Loaded once as a Python set for O(1) lookup speed.
+        Any audio that already exists is skipped without re-converting.
+
+
+  6.2  NAMING CONVENTION
+  ....................................................................
+
+        Input:   videos/MyLecture.mp4
+        Output:  audios/1_MyLecture.mp3
+
+        The number prefix (1_, 2_, 3_...) is critical. It becomes the
+        video reference number shown in all Q&A answers.
+
+
+  6.3  FFMPEG COMMAND EXPLAINED
+  ....................................................................
+
+        ffmpeg
+          -y                     Overwrite output file without asking
+          -i videos/input.mp4    Input video file
+          -vn                    No video: strip the video track, keep audio only
+          -acodec libmp3lame     Encode using the standard MP3 encoder
+          -q:a 4                 Variable bitrate, quality level 4
+                                 (scale: 0=best, 9=worst; 4 is ideal for speech)
+          -threads 0             Use all available CPU threads for this job
+          audios/output.mp3      Output audio file
+
+
+  6.4  PARALLEL PROCESSING
+  ....................................................................
+
+        max_workers = min(4, os.cpu_count() or 2)
+
+        Uses Python's ThreadPoolExecutor to run multiple FFmpeg processes at once.
+        If you have 4+ CPU cores, all 4 videos convert simultaneously.
+        as_completed() prints results as each video finishes, not in submission order.
+        Each individual conversion has a 1-hour timeout to handle very long lectures.
+
+
+
+
+  SECTION 7   mp3_to_json.py  -  STAGE 2
+________________________________________________________________________________
+
+  Transcribes every MP3 in audios/ into a timestamped JSON in jsons/.
+
+  7.1  GPU DETECTION
+  ....................................................................
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        If an NVIDIA GPU is available, all transcription runs on it.
+        If not, falls back to CPU (works but takes much longer).
+
+
+  7.2  WHISPER MODEL SELECTION
+  ....................................................................
+
+        Primary:  whisper.load_model("small", device=device)
+        Fallback: whisper.load_model("base",  device=device)
+        Fallback: whisper.load_model("tiny",  device=device)
+
+        Model comparison:
+
+              Model    Parameters    VRAM     Speed       Accuracy
+              tiny        39M        ~1 GB   fastest       lowest
+              base        74M        ~1 GB   fast          low
+              small      244M        ~2 GB   medium        good   <- used here
+              medium     769M        ~5 GB   slow          better
+              large     1550M       ~10 GB   slowest       best
+
+
+  7.3  FILENAME PARSING
+  ....................................................................
+
+        The audio file is named like:   1_LectureName.mp3
+
+        name = os.path.splitext(audio)[0]   ->   "1_LectureName"
+        parts = name.split("_", 1)
+        number = parts[0]                   ->   "1"
+        title  = parts[1]                   ->   "LectureName"
+
+        split("_", 1) splits on the FIRST underscore only, so a title like
+        "My_Cool_Lecture" is kept intact as the title.
+
+
+  7.4  TRANSCRIPTION SETTINGS EXPLAINED
+  ....................................................................
+
+        model.transcribe(
+            audio    = audio_path,
+            language = "en",
+            fp16     = (device == "cuda"),
+            verbose  = False,
+            task     = "transcribe",
+            condition_on_previous_text = True
+        )
+
+        language="en"
+             Tells Whisper the audio is English. Skips language detection step.
+
+        fp16=True  (only on GPU)
+             Uses 16-bit floating point math instead of 32-bit.
+             Halves VRAM usage and doubles transcription speed.
+             Accuracy loss is negligible for speech recognition.
+
+        verbose=False
+             Suppresses Whisper's own progress printing so only clean logs appear.
+
+        task="transcribe"
+             Keep audio in its original language.
+             Alternative is "translate" which would convert everything to English.
+
+        condition_on_previous_text=True
+             Each audio segment is transcribed with awareness of what came before.
+             Essential for long lectures. Prevents repetition and context loss
+             that would occur if every segment were treated independently.
+
+
+  7.5  JSON OUTPUT FORMAT
+  ....................................................................
+
+        Each audio file produces one JSON file:
+
+        File name:  jsons/1_LectureName.mp3.json
+
+        Content structure:
+
+              {
+                "chunks": [
+                  {
+                    "number": "1",
+                    "title":  "LectureName",
+                    "start":  14.5,
+                    "end":    16.8,
+                    "text":   "gradient descent iteratively adjusts parameters"
+                  },
+                  ...more segments...
+                ],
+                "text":     "the full transcript as one long string",
+                "language": "en"
+              }
+
+        start and end are in seconds from the beginning of the video.
+
+
+  7.6  GPU MEMORY MANAGEMENT
+  ....................................................................
+
+        After each audio file is processed:
+             torch.cuda.empty_cache()
+
+        Forces PyTorch to release GPU memory it's holding but no longer using.
+        Prevents out-of-memory errors when transcribing many long lectures
+        in a single session.
+
+
+
+
+  SECTION 8   preprocess_json.py  -  STAGE 3
+________________________________________________________________________________
+
+  Reads all JSON transcripts, merges small segments into searchable chunks,
+  converts each chunk to a vector, and saves the database.
+
+  8.1  HTTP RETRY LOGIC
+  ....................................................................
+
+        Retry(connect=3, backoff_factor=0.5, status_forcelist=[500,502,503,504])
+
+        If Ollama returns a server error (5xx), the request is retried:
+             Attempt 1  ->  fails  ->  wait 0.5 seconds
+             Attempt 2  ->  fails  ->  wait 1.0 second
+             Attempt 3  ->  fails  ->  wait 2.0 seconds
+             If all 3 fail  ->  raise the error
+
+        This handles brief Ollama hiccups without crashing the whole pipeline.
+
+
+  8.2  THE CHUNK MERGING ALGORITHM  (most important algorithm in the project)
+  ....................................................................
+
+        Raw Whisper output produces tiny segments:  1-3 seconds, 5-15 words each.
+        Searching these fragments would give poor results because a complete idea
+        is spread across dozens of them.
+
+        Solution: merge them into 150-word chunks with 30-word overlap.
+
+        How the algorithm works:
+
+             Accumulate segment texts in a buffer.
+             Keep a running word count.
+             When the buffer reaches 150 words:
+               1. Save the buffer as a completed chunk
+               2. Identify the last 30 words in the buffer
+               3. Start the next buffer with those 30 words already in it
+               4. Continue adding new segments
+
+        Why 30-word overlap?
+             If an important idea is explained right at the boundary between
+             two chunks, the overlap ensures that explanation fully appears
+             in at least one of them. Without overlap, ideas would be
+             arbitrarily split and retrieval would miss them.
+
+        Timestamp tracking:
+             buf_start  is set when the first segment enters the buffer
+             buf_end    updates with every new segment added
+             This gives each merged chunk an accurate time range.
+
+        Visual example:
+
+             Whisper segments:
+             [seg1] [seg2] [seg3] ... [seg30] [seg31] ... [seg35] [seg36] ...
+
+             Chunk 1:  [seg1 through seg30]  (total: ~150 words)
+             Chunk 2:  [seg28 seg29 seg30] + [seg31 seg32 ...]  (30-word overlap)
+
+
+  8.3  BATCH EMBEDDING GENERATION
+  ....................................................................
+
+        create_embedding(text_list, batch_size=128)
+
+        Splits all chunk texts into batches of 128.
+        Sends each batch to Ollama in a single HTTP request.
+        One call returns 128 embeddings at once.
+
+        This is approximately 100x more efficient than sending chunks one by one.
+
+        On failure, falls back to sending texts individually.
+        If even a single text fails, the error is raised (cannot continue).
+
+        nomic-embed-text returns a 768-dimensional vector for each input text.
+        768 numbers that numerically represent the meaning of the text.
+
+
+  8.4  WHAT GETS SAVED TO DISK
+  ....................................................................
+
+        embeddings.joblib
+             A Pandas DataFrame saved with joblib compression level 3.
+             Each row is one chunk. Columns:
+                  number      video number string  (e.g. "2")
+                  title       video title string
+                  start       start time in seconds  (float)
+                  end         end time in seconds  (float)
+                  text        the merged chunk text  (string)
+                  chunk_id    unique integer ID
+                  embedding   the 768-float vector  (list)
+
+        embedding_matrix.npy
+             A 2D NumPy array of shape  [total_chunks  x  768]
+             Data type: float32  (32-bit instead of default 64-bit)
+             This halves memory usage with no meaningful accuracy loss.
+             Loaded directly into RAM at startup for millisecond-speed search.
+
+
+
+
+  SECTION 9   DATA IN EACH CHUNK
+________________________________________________________________________________
+
+        Field        Type          Example
+        ----------   ----------    ------------------------------------------
+        number       string        "2"
+        title        string        "Lecture_03_Backprop"
+        start        float         870.5   (seconds from video start)
+        end          float         940.2   (seconds from video start)
+        text         string        "gradient descent iteratively adjusts..."
+        chunk_id     integer       47
+        embedding    768 floats    [0.023, -0.451, 0.318, ..., 0.112]
+
+
+
+
+  SECTION 10   THREADING ARCHITECTURE
+________________________________________________________________________________
+
+  The app runs multiple threads simultaneously so the UI never freezes.
+
+        MAIN THREAD  (Tkinter event loop)
+        |
+        |-- DAEMON THREAD  A  :  _ensure_ollama_running
+        |         Polls localhost:11434 every second
+        |         Auto-launches  "ollama serve"  if not already running
+        |         Exits when Ollama responds successfully
+        |
+        |-- DAEMON THREAD  B  :  _warm_models
+        |         Waits 2 seconds, then sends warmup requests to both models
+        |         Loads nomic-embed-text and qwen2.5:1.5b into GPU VRAM
+        |         Exits after warmup is complete
+        |
+        |-- DAEMON THREAD  C  :  _process   (only while processing)
+        |         Runs the three pipeline scripts sequentially
+        |         All UI updates go through root.after(0, ...)
+        |         Re-enables buttons in the finally block on completion
+        |
+        +-- DAEMON THREAD  D  :  _answer   (only while answering)
+                  Embeds question, searches chunks, generates response
+                  All UI updates go through root.after(0, ...)
+                  Re-enables Ask button when done
+
+  All threads are daemon threads.
+  When the main window closes, all daemon threads are killed automatically.
+
+  Rule: NEVER touch a Tkinter widget directly from a background thread.
+        Always use  root.after(0, lambda: widget_operation())
+        This schedules the operation to run on the main thread safely.
+
+
+
+
+  SECTION 11   FILES GENERATED AT RUNTIME
+________________________________________________________________________________
+
+        File                        Created By          Est. Size (1hr lecture)
+        --------------------------  ------------------  -----------------------
+        videos/lecture.mp4          User                ~1 GB
+        audios/1_lecture.mp3        video_to_mp3.py    ~100 MB
+        jsons/1_lecture.mp3.json    mp3_to_json.py     ~10 MB
+        embeddings.joblib           preprocess_json.py  ~5 MB
+        embedding_matrix.npy        preprocess_json.py  ~500 KB
+
+        Total data reduction from 1 GB source to ~500 KB search matrix: ~2000:1
+
+
+
+
+  SECTION 12   THE TWO AI MODELS
+________________________________________________________________________________
+
+        nomic-embed-text
+             Type        Embedding model (converts text to vectors)
+             Output      768 floating-point numbers per input text
+             Used when   Building the chunk database  AND  embedding questions
+             Strength    Trained specifically for semantic text similarity
+             Size        Small and fast, runs locally with minimal resources
+
+        qwen2.5:1.5b
+             Type        Large Language Model (generates natural language)
+             Parameters  1.5 billion
+             VRAM needed ~2 GB
+             Used when   Generating the final answer from the context chunks
+             Settings    temperature=0.2  (factual, not creative)
+                         top_p=0.9       (samples from top 90% probability)
+                         max tokens=300  (keeps answers concise)
+             Strength    Small enough for a 4 GB laptop GPU (tested on RTX 3050)
+                         Still produces coherent, accurate answers
+
+
+
+
+  SECTION 13   ALL PERFORMANCE OPTIMIZATIONS
+________________________________________________________________________________
+
+        Optimization                     Where                 Effect
+        -------------------------------- --------------------  -----------------------
+        Parallel FFmpeg (4 workers)      video_to_mp3.py       4x faster conversion
+        fp16 half-precision on GPU       mp3_to_json.py        2x speed, half VRAM
+        condition_on_previous_text       mp3_to_json.py        Coherent transcription
+        GPU cache cleared after each     mp3_to_json.py        No out-of-memory errors
+        Batch embeddings (128 at once)   preprocess_json.py    ~100x fewer API calls
+        HTTP retry with backoff          preprocess_json.py    Survives Ollama hiccups
+        float32 instead of float64       preprocess_json.py    Half matrix memory
+        Precomputed embedding matrix     dashboard.py          Search in milliseconds
+        HTTP connection pool             dashboard.py          Reused TCP connections
+        Model pre-warming on startup     dashboard.py          Zero cold-start latency
+        Daemon background threads        dashboard.py          UI never freezes
+        root.after(0,...) for UI         dashboard.py          Thread-safe updates
+        30-word chunk overlap            preprocess_json.py    Better boundary retrieval
+
+
+
+
+  SECTION 14   EXTERNAL DEPENDENCIES
+________________________________________________________________________________
+
+        Tool              How to Get It
+        ----------------  -------------------------------------------------------
+        Python 3.10+      https://python.org
+        FFmpeg            choco install ffmpeg  (Windows)  or  ffmpeg.org
+        Ollama            https://ollama.com  then run  "ollama serve"
+        nomic-embed-text  ollama pull nomic-embed-text   (after Ollama installed)
+        qwen2.5:1.5b      ollama pull qwen2.5:1.5b       (after Ollama installed)
+
+        Python packages  (install with: pip install -r requirements.txt)
+        ----------------  -------------------------------------------------------
+        openai-whisper    Speech-to-text transcription
+        torch             GPU acceleration via CUDA
+        requests          HTTP calls to Ollama API
+        numpy             Fast array math and .npy file storage
+        pandas            DataFrame storage for chunks
+        scikit-learn      Cosine similarity computation
+        joblib            Efficient Python object serialization
+
+
+
+
+  SECTION 15   QUICK START GUIDE
+________________________________________________________________________________
+
+        1.  pip install -r requirements.txt
+
+        2.  Confirm FFmpeg works:
+                ffmpeg -version
+
+        3.  Start Ollama (or let the app start it automatically):
+                ollama serve
+
+        4.  Pull the models (first time only):
+                ollama pull nomic-embed-text
+                ollama pull qwen2.5:1.5b
+
+        5.  Launch the app:
+                Double-click run.bat
+                OR run:  python dashboard.py
+
+        6.  In the app:
+                Click  Upload Videos  and select your lecture files
+                Click  Process Videos  and wait  (this may take several minutes)
+                Type your question and press Enter or click Ask
+
+
+
+
+  SECTION 16   TROUBLESHOOTING
+________________________________________________________________________________
+
+        Problem                           Solution
+        --------------------------------  -------------------------------------------
+        Cannot connect to Ollama          Run:  ollama serve
+        No answers after processing       Click  Process Videos  again to re-index
+        FFmpeg not found                  Install FFmpeg and add it to your PATH
+        First question is very slow       Wait for  "Models warmed up"  in terminal
+        Transcription is slow             Ensure PyTorch with CUDA is installed
+                                          Close other GPU-heavy applications
+        Answer is wrong or irrelevant     The question may be off-topic for the videos
+                                          Try rephrasing with more specific terms
+
+
+
+
+  SECTION 17   KNOWN LIMITATIONS AND FUTURE PLANS
+________________________________________________________________________________
+
+        Current Limitation               Impact                    Planned Fix
+        -------------------------------- ------------------------- -----------------------
+        Full wipe on every launch        Cannot persist sessions   Incremental indexing
+        Only Whisper small model         Medium transcription      User-selectable model
+        No retrieval evaluation          Quality is unknown        Precision/recall score
+        LLM model hardcoded              Cannot swap via UI        Model selector dropdown
+        Timestamps shown as text only    Cannot click to jump      Clickable video links
+        Fixed 150-word chunk size        Bad boundary splits       Sentence-aware chunking
+
+
+================================================================================
+  END OF BLUEPRINT
+================================================================================
