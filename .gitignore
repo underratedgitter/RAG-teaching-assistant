@@ -22,3 +22,6 @@ jsons/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Embedding cache — regenerable, and large
+.embed_cache/

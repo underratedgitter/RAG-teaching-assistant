@@ -1,12 +1,62 @@
 import requests
 import os
 import json
+import hashlib
 import numpy as np
 import pandas as pd
 import joblib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+# Batches in flight at once. Ollama serialises work internally, so a few is
+# plenty — this is about not leaving the GPU idle between requests.
+EMBED_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "3"))
+
+CACHE_DIR = ".embed_cache"
+
+
+def cache_key(texts):
+    """Identity of a file's chunked text, plus the model that embedded it."""
+    h = hashlib.sha256()
+    h.update(EMBED_MODEL.encode())
+    for t in texts:
+        h.update(b"\x00")
+        h.update(t.encode("utf-8"))
+    return h.hexdigest()
+
+
+def load_cached(json_file, texts):
+    """Embeddings from a previous run, if this file's text is unchanged."""
+    path = os.path.join(CACHE_DIR, f"{json_file}.joblib")
+    if not os.path.exists(path):
+        return None
+    try:
+        blob = joblib.load(path)
+        if blob.get("key") == cache_key(texts) and len(blob.get("embeddings", [])) == len(texts):
+            return blob["embeddings"]
+    except Exception:
+        pass
+    return None
+
+
+def save_cached(json_file, texts, embeddings):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{json_file}.joblib")
+    tmp = path + ".partial"
+    try:
+        joblib.dump({"key": cache_key(texts), "embeddings": embeddings}, tmp)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"   [WARNING] Could not cache embeddings for {json_file}: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 # Session with retry logic and connection pooling.
 #
@@ -26,36 +76,51 @@ retry = Retry(
 adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
 session.mount('http://', adapter)
 
-def create_embedding(text_list, batch_size=128):
-    """Create embeddings with optimized batching and error handling"""
-    all_embeddings = []
-    
-    for i in range(0, len(text_list), batch_size):
-        batch = text_list[i:i + batch_size]
-        try:
-            r = session.post("http://localhost:11434/api/embed", 
-                json={"model": "nomic-embed-text", "input": batch},
-                timeout=60)
+def _embed_batch(batch):
+    """Embed one batch, falling back to one-at-a-time if the batch fails."""
+    try:
+        r = session.post(f"{OLLAMA_URL}/api/embed",
+            json={"model": EMBED_MODEL, "input": batch},
+            timeout=120)
+        r.raise_for_status()
+        return r.json()["embeddings"]
+    except requests.exceptions.RequestException as e:
+        print(f"   [WARNING] Embedding request failed: {e}")
+        if len(batch) == 1:
+            raise
+        # One bad chunk shouldn't cost the whole batch.
+        out = []
+        for text in batch:
+            r = session.post(f"{OLLAMA_URL}/api/embed",
+                json={"model": EMBED_MODEL, "input": [text]},
+                timeout=120)
             r.raise_for_status()
-            all_embeddings.extend(r.json()["embeddings"])
-        except requests.exceptions.RequestException as e:
-            print(f"   [WARNING] Embedding request failed: {e}")
-            # Retry with smaller batch
-            if len(batch) > 1:
-                for text in batch:
-                    try:
-                        r = session.post("http://localhost:11434/api/embed",
-                            json={"model": "nomic-embed-text", "input": [text]},
-                            timeout=60)
-                        r.raise_for_status()
-                        all_embeddings.extend(r.json()["embeddings"])
-                    except Exception as e2:
-                        print(f"    [ERROR] Failed to embed text: {e2}")
-                        raise
-            else:
-                raise
-    
-    return all_embeddings
+            out.extend(r.json()["embeddings"])
+        return out
+
+
+def create_embedding(text_list, batch_size=128):
+    """Embed a list of texts, several batches in flight at once.
+
+    Ollama serves concurrent requests, and a single batch leaves the GPU idle
+    while the next one is being serialised and sent. Overlapping a few keeps
+    it fed. Results are reassembled in the original order — retrieval maps
+    embeddings to chunks positionally, so order is not optional.
+    """
+    if not text_list:
+        return []
+
+    batches = [text_list[i:i + batch_size] for i in range(0, len(text_list), batch_size)]
+    if len(batches) == 1:
+        return _embed_batch(batches[0])
+
+    results = [None] * len(batches)
+    with ThreadPoolExecutor(max_workers=EMBED_CONCURRENCY) as pool:
+        futures = {pool.submit(_embed_batch, b): i for i, b in enumerate(batches)}
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()   # raises if a batch failed
+
+    return [vec for batch in results for vec in batch]
 
 
 def merge_segments(chunks, target_words=150, overlap_words=30):
@@ -120,6 +185,7 @@ my_dicts = []
 chunk_id = 0
 total_chunks = 0
 failed = []
+cached_files = 0
 
 for json_idx, json_file in enumerate(jsons, 1):
     try:
@@ -132,9 +198,18 @@ for json_idx, json_file in enumerate(jsons, 1):
         chunk_count = len(merged_chunks)
         print(f"\n[+] [{json_idx}/{len(jsons)}] {json_file}: {len(raw_chunks)} segs -> {chunk_count} chunks")
 
-        # Create embeddings with optimized batch size
+        # Embedding is the expensive stage, and adding one lecture used to
+        # re-embed the entire library. Cached by a hash of this file's chunk
+        # text plus the model name, so unchanged files cost nothing and a
+        # changed transcript or a different model invalidates itself.
         texts = [c['text'] for c in merged_chunks]
-        embeddings = create_embedding(texts, batch_size=128)
+        embeddings = load_cached(json_file, texts)
+        if embeddings is None:
+            embeddings = create_embedding(texts, batch_size=128)
+            save_cached(json_file, texts, embeddings)
+        else:
+            cached_files += 1
+            print(f"   [=] Reusing cached embeddings")
 
         for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
@@ -175,7 +250,8 @@ np.save('embedding_matrix.npy', embedding_matrix)
 
 elapsed = time.time() - start_time
 print(f"\n[SUCCESS] Complete!")
-print(f"   Files embedded: {len(jsons) - len(failed)}/{len(jsons)}")
+print(f"   Files embedded: {len(jsons) - len(failed)}/{len(jsons)}"
+      f"  ({cached_files} reused from cache)")
 print(f"   Total chunks: {total_chunks}")
 print(f"   Time: {elapsed:.1f}s")
 if elapsed > 0:

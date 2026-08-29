@@ -26,6 +26,18 @@ def pick_device():
 device = pick_device()
 print(f"Using: {device.upper()}")
 
+if device == "cuda":
+    # Whisper feeds fixed 30-second windows, so every convolution sees the
+    # same input shape. cuDNN can then benchmark once and reuse the fastest
+    # algorithm for the rest of the run instead of re-picking per call.
+    torch.backends.cudnn.benchmark = True
+    try:
+        name = torch.cuda.get_device_name(0)
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU: {name} ({total:.1f} GB)")
+    except Exception:
+        pass
+
 # Model size is the biggest lever on transcription time, and the right
 # default depends on the hardware: 'small' is comfortable on a GPU but
 # several times slower than real time on a CPU-only machine. Override with
@@ -171,18 +183,22 @@ for idx, audio in enumerate(audios, 1):
                 pass
             results["failed"] += 1
         
-        # Clear GPU cache
-        if device == "cuda":
-            torch.cuda.empty_cache()
-            
+        # Deliberately no empty_cache() here. It hands PyTorch's cached blocks
+        # back to the driver, so the next file re-allocates from scratch —
+        # paying an allocation cost per lecture to free memory that was about
+        # to be reused anyway. The allocator is left to do its job; the cache
+        # is only cleared below, when recovering from a failure.
+
     except Exception as e:
         print(f"  [!] Transcription failed: {e}")
         results["failed"] += 1
-        # Continue with next file instead of crashing
+        # Continue with next file instead of crashing. Here the cache clear
+        # earns its place: the likely cause is OOM, and releasing blocks gives
+        # the next file a chance of fitting.
         if device == "cuda":
             try:
                 torch.cuda.empty_cache()
-            except:
+            except Exception:
                 pass
 
 elapsed_total = time.time() - start_total

@@ -29,8 +29,10 @@ jobs:
 
       # The chunking tests import merge_segments directly and need no heavy
       # dependencies — torch and whisper are not installed here.
+      # The tests exercise chunking, caching and batch ordering directly.
+      # torch and whisper are heavy and not needed for any of them.
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest joblib numpy pandas requests
 
       - name: Run tests
         run: pytest tests/ -q

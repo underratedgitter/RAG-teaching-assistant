@@ -20,7 +20,9 @@ videos/  ──video_to_mp3──>  audios/  ──mp3_to_json──>  jsons/  �
 
 **2. `mp3_to_json.py`** — transcribes with Whisper, keeping each segment's `start` and `end` timestamps. Picks CUDA when it's available and falls back to CPU. If the `small` model won't load it degrades to `base`, then `tiny`, rather than failing outright — a machine with less VRAM gets a worse transcript instead of no transcript.
 
-**3. `preprocess_json.py`** — Whisper's segments are too short to retrieve against on their own, so `merge_segments()` combines them into ~150-word chunks with a 30-word overlap. Overlap matters: it stops an answer being cut in half at a chunk boundary. Chunks are embedded with `nomic-embed-text` in batches of 128, with a retrying HTTP session and a per-item fallback so one bad chunk doesn't lose the batch.
+**3. `preprocess_json.py`** — Whisper's segments are too short to retrieve against on their own, so `merge_segments()` combines them into ~150-word chunks with a 30-word overlap. Overlap matters: it stops an answer being cut in half at a chunk boundary. Chunks are embedded with `nomic-embed-text` in batches of 128, several batches in flight at once, with a retrying HTTP session and a per-item fallback so one bad chunk doesn't lose the batch.
+
+Embeddings are cached per file under `.embed_cache/`, keyed by a hash of that file's chunk text and the model name. Adding one lecture to a library of twenty re-embeds one lecture, not twenty. Editing a transcript or switching embedding model invalidates only what changed.
 
 **4. `dashboard.py`** — a Tkinter interface. Your question is embedded, compared against every chunk by cosine similarity, and the top 8 above a 0.3 threshold are passed to `qwen2.5:1.5b` as context. If nothing clears the threshold it falls back to the best 3, so you get a hedged answer rather than silence.
 
@@ -63,6 +65,7 @@ Everything is overridable by environment variable:
 | `WHISPER_DEVICE` | auto | force `cuda`, `mps` or `cpu` |
 | `OLLAMA_URL` | `http://localhost:11434` | where Ollama listens |
 | `EMBED_MODEL` | `nomic-embed-text` | embedding model |
+| `EMBED_CONCURRENCY` | `3` | embedding batches in flight at once |
 | `ANSWER_MODEL` | `qwen2.5:1.5b` | answering model |
 | `CLEAR_ON_START` | unset | `1` wipes all work on launch, for a clean demo |
 
@@ -113,6 +116,6 @@ project_blueprint.txt design notes
 pip install pytest && pytest tests/ -q
 ```
 
-Twenty-eight tests covering chunk sizing, timestamp correctness, overlap,
-content preservation, linear scaling, and the crash-safety of every file the
-pipeline writes. They need no models and no network.
+Forty-one tests covering chunk sizing, timestamp correctness, overlap,
+content preservation, linear scaling, embedding-cache invalidation, parallel
+batch ordering, and the crash-safety of every file the pipeline writes. They need no models and no network.
