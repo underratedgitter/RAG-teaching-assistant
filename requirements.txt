@@ -1,7 +1,8 @@
-openai-whisper
-torch
-requests
-numpy
-pandas
-scikit-learn
-joblib
+# Pinned to lower bounds so a fresh install six months from now still
+# resolves a compatible set. openai-whisper and torch in particular drift.
+openai-whisper>=20231117
+torch>=2.0,<3
+requests>=2.31,<3
+numpy>=1.24,<3
+pandas>=2.0,<3
+joblib>=1.3,<2

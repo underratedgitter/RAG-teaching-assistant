@@ -7,12 +7,22 @@ import threading
 import subprocess
 import sys
 import time
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import joblib
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ── Retrieval tuning ─────────────────────────────────────────────────────────
+# Raise TOP_K to give the model more context at the cost of a longer prompt;
+# raise the threshold to be stricter about relevance.
+TOP_K = 8                   # chunks considered for the answer
+SIMILARITY_THRESHOLD = 0.3  # below this a chunk is treated as unrelated
+FALLBACK_K = 3              # used when nothing clears the threshold
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+ANSWER_MODEL = os.environ.get("ANSWER_MODEL", "qwen2.5:1.5b")
 
 # RAG Teaching Assistant Dashboard Interface
 class RAGDashboard:
@@ -58,7 +68,19 @@ class RAGDashboard:
             self.create_ui()  # Still create UI so app doesn't crash
 
     def _clear_work_dirs_on_start(self):
-        """Remove all videos, audios, jsons, and embedding cache on launch."""
+        """Remove all videos, audios, jsons, and embedding cache on launch.
+
+        Off by default. video_to_mp3.py and mp3_to_json.py both skip files
+        they have already produced, so that work is meant to be reused —
+        wiping it every launch made that skip logic unreachable and forced a
+        full re-transcription each session, which is minutes of GPU time per
+        lecture.
+
+        Set CLEAR_ON_START=1 to restore the old behaviour for a clean demo.
+        """
+        if os.environ.get("CLEAR_ON_START") != "1":
+            return
+
         dirs = [self.videos_dir, self.audios_dir, self.jsons_dir]
         for path in dirs:
             try:
@@ -150,7 +172,7 @@ class RAGDashboard:
         while attempt < max_attempts:
             try:
                 # Try to connect to Ollama
-                response = self.session.get("http://localhost:11434/api/tags", timeout=2)
+                response = self.session.get(f"{OLLAMA_URL}/api/tags", timeout=2)
                 if response.status_code == 200:
                     self.log_safe("✓ Connected to Ollama server")
                     return True
@@ -183,10 +205,10 @@ class RAGDashboard:
             # Wait a bit for Ollama to be ready
             time.sleep(2)
             
-            self.session.post("http://localhost:11434/api/embed",
-                json={"model": "nomic-embed-text", "input": ["warmup"]}, timeout=30)
-            self.session.post("http://localhost:11434/api/generate",
-                json={"model": "qwen2.5:1.5b", "prompt": "hi", "stream": False,
+            self.session.post(f"{OLLAMA_URL}/api/embed",
+                json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=30)
+            self.session.post(f"{OLLAMA_URL}/api/generate",
+                json={"model": ANSWER_MODEL, "prompt": "hi", "stream": False,
                       "options": {"num_predict": 1}}, timeout=30)
             self.log_safe("✓ Ollama models warmed up - ready for queries.")
         except Exception as e:
@@ -221,6 +243,7 @@ class RAGDashboard:
                             self.embedding_matrix = np.vstack(self.df['embedding'].values)
                     else:
                         self.embedding_matrix = np.vstack(self.df['embedding'].values)
+                    self._prepare_matrix()
                 except Exception as e:
                     self.df = None
                     self.embedding_matrix = None
@@ -228,6 +251,21 @@ class RAGDashboard:
         except Exception as e:
             self.df = None
             self.embedding_matrix = None
+
+    def _prepare_matrix(self):
+        """Normalise the corpus once, at load, instead of on every question.
+
+        With unit-length rows, cosine similarity is just a dot product, so a
+        query no longer recomputes norms for the whole corpus. This also stops
+        the per-query `.astype(np.float32)` that copied the entire matrix
+        (~30 MB at 10k chunks) every time someone asked something.
+        """
+        if self.embedding_matrix is None:
+            return
+        m = np.ascontiguousarray(self.embedding_matrix, dtype=np.float32)
+        norms = np.linalg.norm(m, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0          # a zero vector would divide by zero
+        self.embedding_matrix = m / norms
                 
     def update_status(self):
         """Update status label with error handling"""
@@ -341,22 +379,39 @@ class RAGDashboard:
     def _answer(self, question):
         try:
             self.log_safe("Creating embedding...")
-            r = self.session.post("http://localhost:11434/api/embed", 
-                json={"model": "nomic-embed-text", "input": [question]},
+            r = self.session.post(f"{OLLAMA_URL}/api/embed", 
+                json={"model": EMBED_MODEL, "input": [question]},
                 timeout=30)
             r.raise_for_status()
             q_embed = r.json()["embeddings"][0]
             
             self.log_safe("Searching... (top 8 results)")
-            matrix = self.embedding_matrix if self.embedding_matrix is not None else np.vstack(self.df['embedding'].values)
-            sims = cosine_similarity(matrix.astype(np.float32), 
-                                    np.array([q_embed], dtype=np.float32)).flatten()
-            top_idx = sims.argsort()[::-1][:8]
-            # Filter out low-similarity results
-            top_idx = [i for i in top_idx if sims[i] > 0.3]
+            matrix = self.embedding_matrix
+            if matrix is None:
+                matrix = np.vstack(self.df['embedding'].values)
+                self.embedding_matrix = matrix
+                self._prepare_matrix()
+                matrix = self.embedding_matrix
+
+            # Rows are unit-length (see _prepare_matrix), so cosine similarity
+            # reduces to a dot product — no per-query norm computation.
+            q = np.asarray(q_embed, dtype=np.float32)
+            qn = np.linalg.norm(q)
+            sims = matrix @ (q / (qn if qn else 1.0))
+
+            # argpartition is O(n); a full argsort was sorting every chunk to
+            # read the top 8.
+            k = min(TOP_K, sims.shape[0])
+            cand = np.argpartition(-sims, k - 1)[:k]
+            cand = cand[np.argsort(-sims[cand])]
+
+            top_idx = [int(i) for i in cand if sims[i] > SIMILARITY_THRESHOLD]
             if not top_idx:
-                top_idx = sims.argsort()[::-1][:3].tolist()
-            chunks = self.df.loc[top_idx]
+                top_idx = [int(i) for i in cand[:FALLBACK_K]]
+
+            # iloc, not loc: these are positional indices from argsort. They
+            # only coincide with labels while the frame has a clean RangeIndex.
+            chunks = self.df.iloc[top_idx]
             
             self.log_safe("Generating response...")
             # Build readable context with timestamps
@@ -383,9 +438,9 @@ Instructions:
 - If the excerpts don't contain enough info, say so.
 - Be concise but thorough.'''
             
-            r = self.session.post("http://localhost:11434/api/generate", 
+            r = self.session.post(f"{OLLAMA_URL}/api/generate", 
                 json={
-                    "model": "qwen2.5:1.5b",
+                    "model": ANSWER_MODEL,
                     "prompt": prompt,
                     "stream": False,
                     "options": {"num_predict": 300, "num_gpu": 99, "temperature": 0.2, "top_p": 0.9}

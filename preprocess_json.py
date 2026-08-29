@@ -8,10 +8,22 @@ import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Session with retry logic and connection pooling
+# Session with retry logic and connection pooling.
+#
+# allowed_methods matters: urllib3 only retries idempotent verbs by default
+# (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
+# retry block did nothing — every embedding call had zero retries.
 session = requests.Session()
-retry = Retry(connect=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1)
+retry = Retry(
+    total=4,
+    connect=3,
+    read=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(["POST", "GET"]),
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
 session.mount('http://', adapter)
 
 def create_embedding(text_list, batch_size=128):
@@ -47,41 +59,51 @@ def create_embedding(text_list, batch_size=128):
 
 
 def merge_segments(chunks, target_words=150, overlap_words=30):
-    """Merge small Whisper segments into larger overlapping chunks for better retrieval."""
+    """Merge small Whisper segments into larger overlapping chunks for retrieval.
+
+    The buffer holds whole segments rather than bare strings, so a chunk's
+    start/end span every segment it contains — including the overlap carried
+    over from the previous chunk. Previously `start` was reset to the segment
+    that triggered the flush, which put every overlapped chunk's timestamp
+    ~12 seconds later than the words it actually quotes.
+
+    The running word count also replaces a `sum(...)` that re-split every
+    buffered segment on every iteration, which made this quadratic.
+    """
     if not chunks:
         return chunks
+
+    title = chunks[0].get("title", "")
+    number = chunks[0].get("number", "1")
+
     merged = []
-    buf_texts, buf_start, buf_end = [], chunks[0]["start"], chunks[0]["end"]
-    title, number = chunks[0].get("title", ""), chunks[0].get("number", "1")
-    overlap_buf = []  # texts to prepend as overlap from previous chunk
+    buf = []       # segment dicts, so overlap keeps its own timing
+    buf_words = 0  # running total
 
-    for seg in chunks:
-        word_count = sum(len(t.split()) for t in buf_texts)
-        if word_count >= target_words:
-            merged.append({
-                "number": number, "title": title,
-                "start": buf_start, "end": buf_end,
-                "text": " ".join(buf_texts).strip()
-            })
-            # keep last few texts as overlap for next chunk
-            overlap_buf = []
-            running = 0
-            for t in reversed(buf_texts):
-                running += len(t.split())
-                overlap_buf.insert(0, t)
-                if running >= overlap_words:
-                    break
-            buf_texts = list(overlap_buf)
-            buf_start = seg["start"]
-        buf_texts.append(seg["text"])
-        buf_end = seg["end"]
-
-    if buf_texts:
+    def flush():
         merged.append({
             "number": number, "title": title,
-            "start": buf_start, "end": buf_end,
-            "text": " ".join(buf_texts).strip()
+            "start": buf[0]["start"],
+            "end": buf[-1]["end"],
+            "text": " ".join(s["text"] for s in buf).strip(),
         })
+
+    for seg in chunks:
+        if buf_words >= target_words:
+            flush()
+            # carry the tail forward as overlap, timestamps included
+            tail, running = [], 0
+            for s in reversed(buf):
+                running += len(s["text"].split())
+                tail.insert(0, s)
+                if running >= overlap_words:
+                    break
+            buf, buf_words = tail, running
+        buf.append(seg)
+        buf_words += len(seg["text"].split())
+
+    if buf:
+        flush()
     return merged
 
 
@@ -97,6 +119,7 @@ print(f"\n[*] Found {len(jsons)} JSON files")
 my_dicts = []
 chunk_id = 0
 total_chunks = 0
+failed = []
 
 for json_idx, json_file in enumerate(jsons, 1):
     try:
@@ -107,26 +130,36 @@ for json_idx, json_file in enumerate(jsons, 1):
         # Merge small segments into bigger overlapping chunks
         merged_chunks = merge_segments(raw_chunks, target_words=150, overlap_words=30)
         chunk_count = len(merged_chunks)
-        total_chunks += chunk_count
         print(f"\n[+] [{json_idx}/{len(jsons)}] {json_file}: {len(raw_chunks)} segs -> {chunk_count} chunks")
-        
+
         # Create embeddings with optimized batch size
         texts = [c['text'] for c in merged_chunks]
         embeddings = create_embedding(texts, batch_size=128)
-           
+
         for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
             chunk['embedding'] = embeddings[i]
             chunk_id += 1
             my_dicts.append(chunk)
-        
+
+        # Counted only once the chunks are actually embedded and kept, so a
+        # skipped file cannot inflate the total.
+        total_chunks += chunk_count
         print(f"   [OK] Embedded {chunk_count} chunks")
     except Exception as e:
+        # Embedding is the slow part of this pipeline. Aborting the whole run
+        # for one unreadable file threw away every file already embedded, so
+        # record it and keep going — the failures are reported at the end.
         print(f"   [ERROR] Failed to process {json_file}: {e}")
-        raise
+        failed.append((json_file, str(e)))
+        continue
 
 if not my_dicts:
     print("\n[ERROR] No chunks to process!")
+    if failed:
+        print("    every file failed:")
+        for name, err in failed:
+            print(f"      {name}: {err}")
     exit(1)
 
 print(f"\n[>] Creating DataFrame with {len(my_dicts)} total chunks...")
@@ -142,10 +175,17 @@ np.save('embedding_matrix.npy', embedding_matrix)
 
 elapsed = time.time() - start_time
 print(f"\n[SUCCESS] Complete!")
+print(f"   Files embedded: {len(jsons) - len(failed)}/{len(jsons)}")
 print(f"   Total chunks: {total_chunks}")
 print(f"   Time: {elapsed:.1f}s")
 if elapsed > 0:
     print(f"   Speed: {total_chunks/elapsed:.1f} chunks/sec")
+
+if failed:
+    print(f"\n[WARNING] {len(failed)} file(s) were skipped:")
+    for name, err in failed:
+        print(f"     {name}: {err}")
+    print("   Everything else was embedded and saved.")
 
 session.close()
 
