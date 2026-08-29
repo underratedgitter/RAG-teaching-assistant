@@ -33,7 +33,18 @@ The model is instructed to answer **only** from the supplied excerpts, which is 
 - Python 3.9+
 - [ffmpeg](https://ffmpeg.org/) on `PATH`
 - [Ollama](https://ollama.com/) running locally
-- A CUDA GPU is optional — it is the difference between a five-minute transcription and a twenty-second one
+
+Runs on Windows, macOS and Linux. Hardware decides the speed, not the code:
+
+| Machine | Whisper runs on | Default model |
+|---|---|---|
+| NVIDIA GPU | CUDA | `small` |
+| Apple Silicon | CPU, or Metal with `WHISPER_DEVICE=mps` | `base` |
+| Intel Mac / no GPU | CPU | `base` |
+
+Transcription on a GPU is roughly twenty seconds where a CPU takes five
+minutes, so on a CPU-only machine the smaller default matters. Override with
+`WHISPER_MODEL=small` if you would rather wait for the accuracy.
 
 ```bash
 pip install -r requirements.txt
@@ -41,6 +52,19 @@ pip install -r requirements.txt
 ollama pull nomic-embed-text     # embeddings
 ollama pull qwen2.5:1.5b         # answering
 ```
+
+### Settings
+
+Everything is overridable by environment variable:
+
+| Variable | Default | Does |
+|---|---|---|
+| `WHISPER_MODEL` | `small` on CUDA, else `base` | transcription accuracy vs speed |
+| `WHISPER_DEVICE` | auto | force `cuda`, `mps` or `cpu` |
+| `OLLAMA_URL` | `http://localhost:11434` | where Ollama listens |
+| `EMBED_MODEL` | `nomic-embed-text` | embedding model |
+| `ANSWER_MODEL` | `qwen2.5:1.5b` | answering model |
+| `CLEAR_ON_START` | unset | `1` wipes all work on launch, for a clean demo |
 
 ---
 
@@ -56,7 +80,10 @@ python preprocess_json.py    # chunk and embed
 python dashboard.py          # ask questions
 ```
 
-Every stage is resumable. Each skips work it has already done, so adding a lecture later does not re-process the library.
+Every stage is resumable. Each skips work it has already done, so adding a
+lecture later does not re-process the library — and output is written to a
+temporary file and renamed into place, so an interrupted run leaves no
+half-finished transcript that later runs would mistake for a complete one.
 
 ---
 
@@ -71,10 +98,21 @@ The trade is quality: `qwen2.5:1.5b` is a small model, and answers are correspon
 ## Layout
 
 ```
-video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable
-mp3_to_json.py        Whisper transcription with timestamps, model fallback
+video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
+mp3_to_json.py        Whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
-dashboard.py          Tkinter UI, cosine retrieval, prompt assembly
+dashboard.py          Tkinter UI, dot-product retrieval, prompt assembly
+tests/                chunking and crash-safety tests
 requirements.txt
 project_blueprint.txt design notes
 ```
+
+## Tests
+
+```bash
+pip install pytest && pytest tests/ -q
+```
+
+Twenty-eight tests covering chunk sizing, timestamp correctness, overlap,
+content preservation, linear scaling, and the crash-safety of every file the
+pipeline writes. They need no models and no network.

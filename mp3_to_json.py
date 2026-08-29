@@ -6,21 +6,48 @@ import time
 
 # Setup for performance and reliability
 os.makedirs("jsons", exist_ok=True)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def pick_device():
+    """CUDA where present, Metal on Apple Silicon, otherwise CPU.
+
+    Whisper's own decoding is not fully supported on MPS in every torch
+    build, so Metal is opt-in via WHISPER_DEVICE=mps rather than automatic.
+    An Intel Mac has neither CUDA nor Metal and lands on CPU.
+    """
+    forced = os.environ.get("WHISPER_DEVICE")
+    if forced:
+        return forced
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+device = pick_device()
 print(f"Using: {device.upper()}")
 
-# Use small model for better accuracy; falls back to base if VRAM is tight
-try:
-    model = whisper.load_model("small", device=device)
-    print("Loaded 'small' model")
-except Exception as e:
-    print(f"[WARNING] Failed to load 'small' model: {e}")
+# Model size is the biggest lever on transcription time, and the right
+# default depends on the hardware: 'small' is comfortable on a GPU but
+# several times slower than real time on a CPU-only machine. Override with
+# WHISPER_MODEL=small|base|tiny.
+_default_model = "small" if device == "cuda" else "base"
+_preferred = os.environ.get("WHISPER_MODEL", _default_model)
+
+_ladder = [_preferred] + [m for m in ("small", "base", "tiny") if m != _preferred]
+model = None
+for _name in _ladder:
     try:
-        model = whisper.load_model("base", device=device)
-        print("Loaded 'base' model")
-    except Exception as e2:
-        print(f"[INFO] Falling back to 'tiny' model")
-        model = whisper.load_model("tiny", device=device)
+        model = whisper.load_model(_name, device=device)
+        print(f"Loaded '{_name}' model")
+        break
+    except Exception as e:
+        print(f"[WARNING] Failed to load '{_name}' model: {e}")
+
+if model is None:
+    # Previously a failure on 'tiny' propagated as an unhandled exception.
+    raise SystemExit(
+        "Could not load any Whisper model. Check the install and free disk space."
+    )
 
 audios = [f for f in os.listdir("audios") if f.endswith('.mp3')]
 
@@ -84,7 +111,7 @@ for idx, audio in enumerate(audios, 1):
         result = model.transcribe(
             audio=audio_path,
             language="en",
-            fp16=(device == "cuda"),
+            fp16=(device == "cuda"),   # half precision is a CUDA feature
             verbose=False,
             task="transcribe",
             condition_on_previous_text=True

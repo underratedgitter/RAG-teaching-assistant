@@ -7,6 +7,7 @@ import threading
 import subprocess
 import sys
 import time
+import platform
 import numpy as np
 import joblib
 import requests
@@ -23,6 +24,23 @@ FALLBACK_K = 3              # used when nothing clears the threshold
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 ANSWER_MODEL = os.environ.get("ANSWER_MODEL", "qwen2.5:1.5b")
+
+
+def _has_gpu_offload():
+    """Whether Ollama can offload layers to a GPU on this machine.
+
+    Ollama uses Metal on Apple Silicon and CUDA/ROCm on Linux and Windows.
+    An Intel Mac has neither, so asking for 99 GPU layers there is at best
+    ignored — it is not a portable default.
+    """
+    if sys.platform == "darwin":
+        return platform.machine() == "arm64"      # Metal, Apple Silicon only
+    return True                                    # let Ollama decide elsewhere
+
+
+GENERATION_OPTIONS = {"num_predict": 300}
+if _has_gpu_offload():
+    GENERATION_OPTIONS["num_gpu"] = 99
 
 # RAG Teaching Assistant Dashboard Interface
 class RAGDashboard:
@@ -115,7 +133,7 @@ class RAGDashboard:
         tk.Button(btn_frame, text="Upload Videos", command=self.upload_videos).pack(side="left", padx=(0,5))
         self.process_btn = tk.Button(btn_frame, text="Process Videos", command=self.process_videos)
         self.process_btn.pack(side="left", padx=(0,5))
-        tk.Button(btn_frame, text="Open Folder", command=lambda: os.startfile(self.videos_dir)).pack(side="left", padx=(0,5))
+        tk.Button(btn_frame, text="Open Folder", command=self.open_videos_folder).pack(side="left", padx=(0,5))
         tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left")
         
         self.status_label = tk.Label(self.root, text="", fg="gray")
@@ -163,6 +181,23 @@ class RAGDashboard:
         self.update_status()
         self.log("Ready. Upload videos and click 'Process Videos' to start.")
         
+    def open_videos_folder(self):
+        """Reveal the videos folder in the system file manager.
+
+        os.startfile does not exist outside Windows, so this button raised
+        AttributeError on macOS and Linux the moment it was clicked.
+        """
+        path = self.videos_dir
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif sys.platform.startswith("win"):
+                os.startfile(path)          # noqa: S606 — Windows only
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self.log(f"Could not open {path}: {e}")
+
     def _ensure_ollama_running(self):
         """Check if Ollama is running, if not start it automatically."""
         max_attempts = 30  # Try for 30 seconds
@@ -443,7 +478,7 @@ Instructions:
                     "model": ANSWER_MODEL,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": 300, "num_gpu": 99, "temperature": 0.2, "top_p": 0.9}
+                    "options": {**GENERATION_OPTIONS, "temperature": 0.2, "top_p": 0.9}
                 },
                 timeout=120)
             r.raise_for_status()

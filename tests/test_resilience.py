@@ -117,3 +117,58 @@ def test_atomic_writes_are_used_everywhere_output_is_produced():
         src = (ROOT / script).read_text()
         assert "os.replace(" in src, f"{script} should rename atomically"
         assert ".partial" in src, f"{script} should stage output in a temp file"
+
+
+# ── cross-platform behaviour ────────────────────────────────────────────────
+
+def test_open_folder_does_not_use_windows_only_api():
+    """os.startfile does not exist on macOS or Linux.
+
+    Regression: the Open Folder button called it unconditionally and raised
+    AttributeError on any non-Windows machine.
+    """
+    src = (ROOT / "dashboard.py").read_text()
+    lines = src.splitlines()
+    calls = [n for n, line in enumerate(lines, 1)
+             if re.search(r"os\.startfile\s*\(", line)]
+    assert calls, "expected a Windows branch to still exist"
+    for line_no in calls:
+        window = "\n".join(lines[max(0, line_no - 5): line_no])
+        assert re.search(r"sys\.platform.*win", window), (
+            f"the os.startfile call at line {line_no} is not inside a Windows branch"
+        )
+
+
+def test_gpu_offload_is_not_assumed_on_intel_mac():
+    """num_gpu must not be sent where no GPU offload exists."""
+    src = (ROOT / "dashboard.py").read_text()
+    assert '"num_gpu": 99' not in src.replace('GENERATION_OPTIONS["num_gpu"] = 99', ""), \
+        "num_gpu should be conditional, not inlined in the request"
+    assert "_has_gpu_offload" in src
+
+
+def test_whisper_device_selection_falls_back_to_cpu(monkeypatch):
+    """No CUDA and no Metal must resolve to CPU rather than erroring."""
+    src = (ROOT / "mp3_to_json.py").read_text()
+    start = src.index("def pick_device")
+    end = src.index("device = pick_device()")
+    ns = {"os": os, "torch": type("t", (), {"cuda": type("c", (), {"is_available": staticmethod(lambda: False)})})}
+    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
+    assert ns["pick_device"]() == "cpu"
+
+
+def test_whisper_device_can_be_forced(monkeypatch):
+    src = (ROOT / "mp3_to_json.py").read_text()
+    start = src.index("def pick_device")
+    end = src.index("device = pick_device()")
+    ns = {"os": os, "torch": type("t", (), {"cuda": type("c", (), {"is_available": staticmethod(lambda: False)})})}
+    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    monkeypatch.setenv("WHISPER_DEVICE", "mps")
+    assert ns["pick_device"]() == "mps"
+
+
+def test_model_load_failure_is_reported_not_raised():
+    """Previously a failure on 'tiny' propagated as an unhandled traceback."""
+    src = (ROOT / "mp3_to_json.py").read_text()
+    assert "SystemExit" in src or "raise SystemExit" in src
