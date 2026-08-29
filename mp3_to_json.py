@@ -23,7 +23,31 @@ except Exception as e:
         model = whisper.load_model("tiny", device=device)
 
 audios = [f for f in os.listdir("audios") if f.endswith('.mp3')]
-existing_jsons = set(os.listdir("jsons"))
+
+
+def already_transcribed(json_filename):
+    """True only if the existing JSON is complete and parseable.
+
+    Checking the filename alone meant a transcript truncated by a crash or a
+    Ctrl+C was skipped on every later run — permanently, and silently, since
+    the file looked done. Anything unreadable is deleted so it gets redone.
+    """
+    path = os.path.join("jsons", json_filename)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("chunks"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        print(f"  [!] {json_filename} is corrupt — re-transcribing")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+
+
 print(f"Found {len(audios)} audio files")
 
 start_total = time.time()
@@ -31,7 +55,7 @@ results = {"success": 0, "skipped": 0, "failed": 0}
 
 for idx, audio in enumerate(audios, 1):
     json_filename = f"{audio}.json"
-    if json_filename in existing_jsons:
+    if already_transcribed(json_filename):
         print(f"[{idx}/{len(audios)}] Skipping {audio} (exists)")
         results["skipped"] += 1
         continue
@@ -95,18 +119,29 @@ for idx, audio in enumerate(audios, 1):
         
         # Save with error handling
         try:
-            with open(f"jsons/{json_filename}", "w", encoding="utf-8") as f:
+            # Write to a temp file and rename, so an interrupted save cannot
+            # leave a half-written transcript that later runs treat as done.
+            tmp_path = f"jsons/.{json_filename}.partial"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump({
-                    "chunks": chunks, 
+                    "chunks": chunks,
                     "text": result.get("text", ""),
                     "language": result.get("language", "en")
                 }, f, ensure_ascii=False)
-            
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, f"jsons/{json_filename}")
+
             elapsed = time.time() - start
             print(f"  [+] Created {len(chunks)} chunks ({elapsed:.1f}s)")
             results["success"] += 1
         except Exception as e:
             print(f"  [!] Failed to save JSON: {e}")
+            try:
+                if os.path.exists(f"jsons/.{json_filename}.partial"):
+                    os.remove(f"jsons/.{json_filename}.partial")
+            except OSError:
+                pass
             results["failed"] += 1
         
         # Clear GPU cache
