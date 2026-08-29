@@ -147,28 +147,119 @@ def test_gpu_offload_is_not_assumed_on_intel_mac():
     assert "_has_gpu_offload" in src
 
 
-def test_whisper_device_selection_falls_back_to_cpu(monkeypatch):
-    """No CUDA and no Metal must resolve to CPU rather than erroring."""
+def _pick_device(cuda_devices=0):
+    """Load pick_device() alone, with a stub CTranslate2 reporting N GPUs."""
     src = (ROOT / "mp3_to_json.py").read_text()
     start = src.index("def pick_device")
     end = src.index("device = pick_device()")
-    ns = {"os": os, "torch": type("t", (), {"cuda": type("c", (), {"is_available": staticmethod(lambda: False)})})}
+    ns = {"os": os, "ctranslate2": type("ct", (), {
+        "get_cuda_device_count": staticmethod(lambda: cuda_devices)})}
     exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    return ns["pick_device"]
+
+
+def test_whisper_device_selection_falls_back_to_cpu(monkeypatch):
+    """No CUDA must resolve to CPU rather than erroring."""
     monkeypatch.delenv("WHISPER_DEVICE", raising=False)
-    assert ns["pick_device"]() == "cpu"
+    assert _pick_device(cuda_devices=0)() == "cpu"
+
+
+def test_whisper_device_selection_finds_cuda(monkeypatch):
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
+    assert _pick_device(cuda_devices=1)() == "cuda"
 
 
 def test_whisper_device_can_be_forced(monkeypatch):
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def pick_device")
-    end = src.index("device = pick_device()")
-    ns = {"os": os, "torch": type("t", (), {"cuda": type("c", (), {"is_available": staticmethod(lambda: False)})})}
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
-    monkeypatch.setenv("WHISPER_DEVICE", "mps")
-    assert ns["pick_device"]() == "mps"
+    monkeypatch.setenv("WHISPER_DEVICE", "cpu")
+    assert _pick_device(cuda_devices=1)() == "cpu"
 
 
 def test_model_load_failure_is_reported_not_raised():
     """Previously a failure on 'tiny' propagated as an unhandled traceback."""
     src = (ROOT / "mp3_to_json.py").read_text()
     assert "SystemExit" in src or "raise SystemExit" in src
+
+
+# ── mp3_to_json: the faster-whisper path ───────────────────────────────────
+
+def _transcription_helpers(model, beam_size=1, use_vad=True):
+    """Load transcribe()/transcribe_with_fallback() against a stub model."""
+    src = (ROOT / "mp3_to_json.py").read_text()
+    start = src.index("def transcribe(")
+    end = src.index('print(f"Found {len(audios)}')
+    ns = {"os": os, "model": model, "_beam_size": beam_size, "_use_vad": use_vad}
+    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    return ns
+
+
+class _Seg:
+    def __init__(self, start, end, text):
+        self.start, self.end, self.text = start, end, text
+
+
+class _Info:
+    duration = 10.0
+    language = "en"
+
+
+class _StubModel:
+    """Records how it was called; optionally fails when VAD is requested."""
+
+    def __init__(self, fail_on_vad=False):
+        self.fail_on_vad = fail_on_vad
+        self.calls = []
+
+    def transcribe(self, path, **kw):
+        self.calls.append(kw)
+        if self.fail_on_vad and kw.get("vad_filter"):
+            raise RuntimeError("vad model missing")
+        return iter([_Seg(0.0, 5.0, "hello"), _Seg(5.0, 10.0, "world")]), _Info()
+
+
+def test_vad_failure_retries_without_vad():
+    """A broken VAD must cost speed, not the lecture."""
+    model = _StubModel(fail_on_vad=True)
+    ns = _transcription_helpers(model)
+    segments, info = ns["transcribe_with_fallback"]("audios/x.mp3")
+    assert [s.text for s in segments] == ["hello", "world"]
+    assert [c["vad_filter"] for c in model.calls] == [True, False]
+
+
+def test_transcription_failure_without_vad_still_raises():
+    """Only VAD gets a second chance; a real failure must not be swallowed."""
+    class Broken(_StubModel):
+        def transcribe(self, path, **kw):
+            raise RuntimeError("corrupt audio")
+
+    ns = _transcription_helpers(Broken())
+    with pytest.raises(RuntimeError, match="corrupt audio"):
+        ns["transcribe_with_fallback"]("audios/x.mp3")
+
+
+def test_segments_are_drained_not_returned_lazily():
+    """faster-whisper returns a generator; a lazy return would defer all the
+    work past the error handling meant to contain it."""
+    ns = _transcription_helpers(_StubModel())
+    segments, _ = ns["transcribe"]("audios/x.mp3", False)
+    assert isinstance(segments, list) and len(segments) == 2
+
+
+def test_greedy_decoding_is_the_default():
+    """beam_size=5 is faster-whisper's default and several times slower."""
+    src = (ROOT / "mp3_to_json.py").read_text()
+    assert 'os.environ.get("WHISPER_BEAM_SIZE", "1")' in src
+
+
+def test_compute_type_matches_the_device():
+    """float16 is a GPU feature; int8 is what makes the CPU path usable."""
+    src = (ROOT / "mp3_to_json.py").read_text()
+    assert '"float16" if device == "cuda" else "int8"' in src
+
+
+def test_torch_is_no_longer_a_dependency():
+    """Transcription runs on CTranslate2; nothing else in the repo needs torch."""
+    reqs = [ln.split("#")[0].strip()
+            for ln in (ROOT / "requirements.txt").read_text().splitlines()]
+    assert not any(ln.startswith("torch") for ln in reqs if ln)
+    for script in ("mp3_to_json.py", "preprocess_json.py", "dashboard.py"):
+        assert "import torch" not in (ROOT / script).read_text()

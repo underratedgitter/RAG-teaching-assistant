@@ -27,10 +27,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      # The chunking tests import merge_segments directly and need no heavy
-      # dependencies — torch and whisper are not installed here.
-      # The tests exercise chunking, caching and batch ordering directly.
-      # torch and whisper are heavy and not needed for any of them.
+      # The tests exercise chunking, caching, batch ordering and device
+      # selection by reading the source directly, so faster-whisper — the
+      # one heavy dependency left — is not installed here.
       - name: Install test dependencies
         run: pip install pytest joblib numpy pandas requests
 

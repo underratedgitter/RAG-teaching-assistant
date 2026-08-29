@@ -1,7 +1,11 @@
 # Pinned to lower bounds so a fresh install six months from now still
-# resolves a compatible set. openai-whisper and torch in particular drift.
-openai-whisper>=20231117
-torch>=2.0,<3
+# resolves a compatible set.
+#
+# faster-whisper runs the same Whisper weights on CTranslate2 instead of
+# PyTorch: several times quicker, a fraction of the memory, and no 2 GB torch
+# download to transcribe a lecture. It replaces openai-whisper, which also no
+# longer builds on current Pythons (llvmlite has no wheel).
+faster-whisper>=1.0,<2
 requests>=2.31,<3
 numpy>=1.24,<3
 pandas>=2.0,<3

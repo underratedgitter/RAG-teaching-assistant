@@ -4,6 +4,8 @@ Drop lecture videos in. Ask a question. Get an answer grounded in what was actua
 
 Runs entirely on your machine — Whisper for transcription, Ollama for embeddings and generation. No API key, no upload, nothing leaves the laptop.
 
+Transcription is the slow stage, so it runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) rather than the reference PyTorch implementation: same weights, roughly **18–27× realtime on a plain CPU**, and no 2 GB torch install to sit through.
+
 ---
 
 ## How it works
@@ -18,7 +20,9 @@ videos/  ──video_to_mp3──>  audios/  ──mp3_to_json──>  jsons/  �
 
 **1. `video_to_mp3.py`** — extracts audio with ffmpeg. Runs conversions in a thread pool, and skips anything already converted, so re-running after adding one video costs one video.
 
-**2. `mp3_to_json.py`** — transcribes with Whisper, keeping each segment's `start` and `end` timestamps. Picks CUDA when it's available and falls back to CPU. If the `small` model won't load it degrades to `base`, then `tiny`, rather than failing outright — a machine with less VRAM gets a worse transcript instead of no transcript.
+**2. `mp3_to_json.py`** — transcribes with faster-whisper, keeping each segment's `start` and `end` timestamps. Picks CUDA when it's available and falls back to CPU, and picks its precision to match: `float16` on a GPU, `int8` on a CPU. Voice-activity detection drops silence before it reaches the model, so the pauses in a lecture cost nothing. Decoding is greedy rather than beam search — on lecture speech the transcript is the same and the decode is several times quicker.
+
+If the `small` model won't load it degrades to `base`, then `tiny`, and each size falls back through lower precisions first, rather than failing outright — a machine with less VRAM gets a worse transcript instead of no transcript.
 
 **3. `preprocess_json.py`** — Whisper's segments are too short to retrieve against on their own, so `merge_segments()` combines them into ~150-word chunks with a 30-word overlap. Overlap matters: it stops an answer being cut in half at a chunk boundary. Chunks are embedded with `nomic-embed-text` in batches of 128, several batches in flight at once, with a retrying HTTP session and a per-item fallback so one bad chunk doesn't lose the batch.
 
@@ -32,21 +36,26 @@ The model is instructed to answer **only** from the supplied excerpts, which is 
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.9–3.13 (PyAV, which faster-whisper decodes audio with, has no 3.14 wheel yet)
 - [ffmpeg](https://ffmpeg.org/) on `PATH`
 - [Ollama](https://ollama.com/) running locally
 
 Runs on Windows, macOS and Linux. Hardware decides the speed, not the code:
 
-| Machine | Whisper runs on | Default model |
-|---|---|---|
-| NVIDIA GPU | CUDA | `small` |
-| Apple Silicon | CPU, or Metal with `WHISPER_DEVICE=mps` | `base` |
-| Intel Mac / no GPU | CPU | `base` |
+| Machine | Whisper runs on | Precision | Default model |
+|---|---|---|---|
+| NVIDIA GPU | CUDA | `float16` | `small` |
+| Apple / no GPU | CPU | `int8` | `base` |
 
-Transcription on a GPU is roughly twenty seconds where a CPU takes five
-minutes, so on a CPU-only machine the smaller default matters. Override with
-`WHISPER_MODEL=small` if you would rather wait for the accuracy.
+CTranslate2 has no Metal backend, so an Apple machine transcribes on the CPU —
+which is now fast enough that it stopped being the problem it was. A measured
+run of the `base` model on an Intel Mac, no GPU at all: **46 seconds of speech
+in 1.7 s, 27× realtime**. An hour of lecture lands in about two minutes.
+
+A CUDA build needs NVIDIA's cuBLAS and cuDNN libraries on `PATH`; if they are
+missing, the loader falls back through `int8_float16` and `float32` and, in
+the worst case, the CPU. Override anything with `WHISPER_MODEL=small` if you
+would rather wait for the accuracy.
 
 ```bash
 pip install -r requirements.txt
@@ -62,7 +71,11 @@ Everything is overridable by environment variable:
 | Variable | Default | Does |
 |---|---|---|
 | `WHISPER_MODEL` | `small` on CUDA, else `base` | transcription accuracy vs speed |
-| `WHISPER_DEVICE` | auto | force `cuda`, `mps` or `cpu` |
+| `WHISPER_DEVICE` | auto | force `cuda` or `cpu` |
+| `WHISPER_COMPUTE_TYPE` | `float16` on CUDA, else `int8` | weight precision |
+| `WHISPER_BEAM_SIZE` | `1` | raise to 5 for hard-to-hear audio |
+| `WHISPER_VAD` | `1` | `0` transcribes silence too |
+| `WHISPER_CPU_THREADS` | all cores | encoder threads on a CPU run |
 | `OLLAMA_URL` | `http://localhost:11434` | where Ollama listens |
 | `EMBED_MODEL` | `nomic-embed-text` | embedding model |
 | `EMBED_CONCURRENCY` | `3` | embedding batches in flight at once |
@@ -102,7 +115,7 @@ The trade is quality: `qwen2.5:1.5b` is a small model, and answers are correspon
 
 ```
 video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
-mp3_to_json.py        Whisper transcription with timestamps, model ladder
+mp3_to_json.py        faster-whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
 dashboard.py          Tkinter UI, dot-product retrieval, prompt assembly
 tests/                chunking and crash-safety tests

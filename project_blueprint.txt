@@ -34,7 +34,7 @@ ________________________________________________________________________________
       |
       |   dashboard.py            MAIN BRAIN  -  UI + Q&A logic  (429 lines)
       |   video_to_mp3.py         Stage 1: Video to Audio         (51 lines)
-      |   mp3_to_json.py          Stage 2: Audio to Transcript    (132 lines)
+      |   mp3_to_json.py          Stage 2: Audio to Transcript    (259 lines)
       |   preprocess_json.py      Stage 3: Text to Embeddings     (152 lines)
       |   requirements.txt        Python package list
       |   README.md               Project documentation
@@ -63,7 +63,7 @@ ________________________________________________________________________________
   Stage 2   mp3_to_json.py
             OpenAI Whisper transcribes speech to text
             Every word gets a start/end timestamp
-            GPU accelerated with fp16 for speed
+            GPU accelerated with float16, or CPU with int8
         |
         v
   Stage 3   preprocess_json.py
@@ -431,18 +431,25 @@ ________________________________________________________________________________
   7.1  GPU DETECTION
   ....................................................................
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if ctranslate2.get_cuda_device_count() else "cpu"
 
-        If an NVIDIA GPU is available, all transcription runs on it.
-        If not, falls back to CPU (works but takes much longer).
+        If an NVIDIA GPU is available, all transcription runs on it at
+        float16. If not, it runs on the CPU at int8 — which on CTranslate2
+        is around 27x realtime for the 'base' model, so CPU-only is now a
+        wait of minutes rather than hours. Metal is not a CTranslate2
+        backend, so Apple machines use the CPU path.
 
 
   7.2  WHISPER MODEL SELECTION
   ....................................................................
 
-        Primary:  whisper.load_model("small", device=device)
-        Fallback: whisper.load_model("base",  device=device)
-        Fallback: whisper.load_model("tiny",  device=device)
+        Primary:  WhisperModel("small", device, compute_type)
+        Fallback: WhisperModel("base",  device, compute_type)
+        Fallback: WhisperModel("tiny",  device, compute_type)
+
+        Each size is tried at each precision before dropping a size:
+            CUDA:  float16 -> int8_float16 -> float32
+            CPU:   int8    -> float32
 
         Model comparison:
 
@@ -472,24 +479,36 @@ ________________________________________________________________________________
   ....................................................................
 
         model.transcribe(
-            audio    = audio_path,
-            language = "en",
-            fp16     = (device == "cuda"),
-            verbose  = False,
-            task     = "transcribe",
+            audio_path,
+            language   = "en",
+            task       = "transcribe",
+            beam_size  = 1,
+            vad_filter = True,
             condition_on_previous_text = True
         )
 
         language="en"
              Tells Whisper the audio is English. Skips language detection step.
 
-        fp16=True  (only on GPU)
-             Uses 16-bit floating point math instead of 32-bit.
-             Halves VRAM usage and doubles transcription speed.
-             Accuracy loss is negligible for speech recognition.
+        beam_size=1
+             Greedy decoding. Beam search keeps five candidate transcripts per
+             30-second window and picks the best at the end; on clear lecture
+             speech it lands on the same words for several times the decode
+             time. WHISPER_BEAM_SIZE raises it for hard-to-hear recordings.
 
-        verbose=False
-             Suppresses Whisper's own progress printing so only clean logs appear.
+        vad_filter=True
+             Voice-activity detection cuts silence out before the model sees
+             it. A lecture is full of pauses, and every second removed is a
+             second never decoded. If VAD itself errors, the file is retried
+             without it rather than failing.
+
+        compute_type  (set at load, not per call)
+             float16 on CUDA, int8 on CPU. This is where the reference
+             implementation's fp16 flag went: precision is now a property of
+             the loaded model. int8 is what makes the CPU path viable at all.
+
+        The call returns a lazy generator, so the work happens while the
+        segments are consumed — which is what lets the loop print progress.
 
         task="transcribe"
              Keep audio in its original language.
@@ -531,12 +550,15 @@ ________________________________________________________________________________
   7.6  GPU MEMORY MANAGEMENT
   ....................................................................
 
-        After each audio file is processed:
-             torch.cuda.empty_cache()
+        Nothing is freed between files.
 
-        Forces PyTorch to release GPU memory it's holding but no longer using.
-        Prevents out-of-memory errors when transcribing many long lectures
-        in a single session.
+        CTranslate2 keeps the model resident and reuses its own buffers, so
+        the next lecture starts decoding immediately instead of re-allocating.
+        The earlier torch.cuda.empty_cache() call between files handed blocks
+        back to the driver only to re-allocate them one file later.
+
+        VRAM pressure is handled at load time instead: the model ladder drops
+        to a lower precision, then a smaller model, until one fits.
 
 
 
@@ -740,9 +762,12 @@ ________________________________________________________________________________
         Optimization                     Where                 Effect
         -------------------------------- --------------------  -----------------------
         Parallel FFmpeg (4 workers)      video_to_mp3.py       4x faster conversion
-        fp16 half-precision on GPU       mp3_to_json.py        2x speed, half VRAM
+        CTranslate2 runtime              mp3_to_json.py        ~4x faster than torch
+        float16 on GPU / int8 on CPU     mp3_to_json.py        2x speed, half the memory
+        Greedy decode (beam_size=1)      mp3_to_json.py        Several times faster decode
+        VAD silence removal              mp3_to_json.py        Pauses cost nothing
+        Model stays resident             mp3_to_json.py        No per-file re-allocation
         condition_on_previous_text       mp3_to_json.py        Coherent transcription
-        GPU cache cleared after each     mp3_to_json.py        No out-of-memory errors
         Batch embeddings (128 at once)   preprocess_json.py    ~100x fewer API calls
         HTTP retry with backoff          preprocess_json.py    Survives Ollama hiccups
         float32 instead of float64       preprocess_json.py    Half matrix memory
@@ -769,8 +794,10 @@ ________________________________________________________________________________
 
         Python packages  (install with: pip install -r requirements.txt)
         ----------------  -------------------------------------------------------
-        openai-whisper    Speech-to-text transcription
-        torch             GPU acceleration via CUDA
+        faster-whisper    Speech-to-text transcription (CTranslate2 runtime,
+                          pulls in ctranslate2, PyAV and tokenizers). Replaced
+                          openai-whisper + torch: several times faster, a
+                          fraction of the RAM, and ~2 GB less to download.
         requests          HTTP calls to Ollama API
         numpy             Fast array math and .npy file storage
         pandas            DataFrame storage for chunks
@@ -816,7 +843,8 @@ ________________________________________________________________________________
         No answers after processing       Click  Process Videos  again to re-index
         FFmpeg not found                  Install FFmpeg and add it to your PATH
         First question is very slow       Wait for  "Models warmed up"  in terminal
-        Transcription is slow             Ensure PyTorch with CUDA is installed
+        Transcription is slow             Check the log line says CUDA, not CPU.
+                                          A CUDA build needs cuBLAS + cuDNN on PATH
                                           Close other GPU-heavy applications
         Answer is wrong or irrelevant     The question may be off-topic for the videos
                                           Try rephrasing with more specific terms
