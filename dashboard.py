@@ -278,6 +278,11 @@ class RAGDashboard:
                             self.embedding_matrix = np.vstack(self.df['embedding'].values)
                     else:
                         self.embedding_matrix = np.vstack(self.df['embedding'].values)
+                    # A run that failed between writing embeddings.joblib and
+                    # embedding_matrix.npy leaves a matrix from an older corpus;
+                    # its row numbers would then point at the wrong chunks.
+                    if self.embedding_matrix.shape[0] != len(self.df):
+                        self.embedding_matrix = np.vstack(self.df['embedding'].values)
                     self._prepare_matrix()
                 except Exception as e:
                     self.df = None
@@ -355,6 +360,7 @@ class RAGDashboard:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",   # a non-UTF-8 byte in tool output must not kill the pipeline thread
             bufsize=1
         )
         
@@ -400,6 +406,11 @@ class RAGDashboard:
     def ask_question(self):
         question = self.question_entry.get().strip()
         if not question:
+            return
+        # The <Return> binding bypasses the disabled Ask button, which let a
+        # question start mid-processing (while embeddings reload) or overlap
+        # an answer already in flight.
+        if str(self.ask_btn["state"]) == "disabled":
             return
         if self.df is None:
             messagebox.showwarning("No Data", "Process videos first!")

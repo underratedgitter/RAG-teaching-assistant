@@ -1,5 +1,6 @@
 # Converts videos to mp3 - Optimized for speed
 import os 
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,6 +8,21 @@ import time
 
 os.makedirs("audios", exist_ok=True)
 existing_audios = set(os.listdir("audios"))
+
+# Audio names carry a position prefix ("3_Lecture.mp3") taken from the sorted
+# video list. Uploading a video that sorts earlier shifts every later index, so
+# matching on the full name re-encoded already-converted lectures under new
+# numbers and indexed them twice. Match on the video name instead.
+converted_by_name = {}
+for existing in existing_audios:
+    m = re.match(r"^\d+_(.+)\.mp3$", existing)
+    if m and os.path.getsize(os.path.join("audios", existing)) > 0:
+        converted_by_name.setdefault(m.group(1), existing)
+
+# New videos take numbers after the highest one already used, so a late upload
+# never reuses a lecture number ("Video 1") that an earlier lecture already has.
+used_numbers = [int(n.split("_", 1)[0]) for n in converted_by_name.values()]
+next_number = max(used_numbers, default=0) + 1
 
 files = [f for f in os.listdir("videos") if f.endswith(('.mp4', '.avi', '.mkv', '.mov'))]
 print(f"Found {len(files)} video files")
@@ -18,8 +34,8 @@ def convert_video(args):
     output_name = f"{i}_{name}.mp3"
     
     final_path = os.path.join("audios", output_name)
-    if output_name in existing_audios and os.path.getsize(final_path) > 0:
-        return True, f"Skipping {file} (exists)"
+    if name in converted_by_name:
+        return True, f"Skipping {file} (exists as {converted_by_name[name]})"
 
     # Encode to a temp file and rename only on success. Writing straight to
     # the final name meant an interrupted ffmpeg left a truncated mp3 that
@@ -70,7 +86,14 @@ max_workers = min(4, os.cpu_count() or 2)
 
 failures = []
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    futures = [executor.submit(convert_video, (i, f)) for i, f in enumerate(sorted(files), 1)]
+    jobs = []
+    for f in sorted(files):
+        if os.path.splitext(f)[0] in converted_by_name:
+            jobs.append((0, f))            # skipped inside convert_video
+        else:
+            jobs.append((next_number, f))
+            next_number += 1
+    futures = [executor.submit(convert_video, job) for job in jobs]
     for future in as_completed(futures):
         ok, message = future.result()
         print(f"  {message}")

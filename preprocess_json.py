@@ -75,6 +75,7 @@ retry = Retry(
 )
 adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
 session.mount('http://', adapter)
+session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
 
 def _embed_batch(batch):
     """Embed one batch, falling back to one-at-a-time if the batch fails."""
@@ -178,7 +179,8 @@ print("="*50)
 
 start_time = time.time()
 
-jsons = [f for f in os.listdir("jsons") if f.endswith('.json')]
+# Sorted so chunk_ids are stable from run to run; listdir order is arbitrary.
+jsons = sorted(f for f in os.listdir("jsons") if f.endswith('.json'))
 print(f"\n[*] Found {len(jsons)} JSON files")
 
 my_dicts = []
