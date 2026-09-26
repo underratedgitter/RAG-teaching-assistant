@@ -60,7 +60,7 @@ def save_cached(json_file, texts, embeddings):
 
 # Session with retry logic and connection pooling.
 #
-# allowed_methods matters: urllib3 only retries idempotent verbs by default
+# allowed_methods matters: urllib3 only retries idempotent verbs by defaul
 # (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
 # retry block did nothing — every embedding call had zero retries.
 session = requests.Session()
@@ -97,7 +97,7 @@ def _embed_batch(batch):
                 timeout=120)
             r.raise_for_status()
             out.extend(r.json()["embeddings"])
-        return out
+        return ou
 
 
 def create_embedding(text_list, batch_size=128):
@@ -129,7 +129,7 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
 
     The buffer holds whole segments rather than bare strings, so a chunk's
     start/end span every segment it contains — including the overlap carried
-    over from the previous chunk. Previously `start` was reset to the segment
+    over from the previous chunk. Previously `start` was reset to the segmen
     that triggered the flush, which put every overlapped chunk's timestamp
     ~12 seconds later than the words it actually quotes.
 
@@ -193,7 +193,7 @@ for json_idx, json_file in enumerate(jsons, 1):
     try:
         with open(f"jsons/{json_file}") as f:
             content = json.load(f)
-        
+
         raw_chunks = content['chunks']
         # Merge small segments into bigger overlapping chunks
         merged_chunks = merge_segments(raw_chunks, target_words=150, overlap_words=30)
@@ -221,7 +221,7 @@ for json_idx, json_file in enumerate(jsons, 1):
 
         # Counted only once the chunks are actually embedded and kept, so a
         # skipped file cannot inflate the total.
-        total_chunks += chunk_count
+        total_chunks += chunk_coun
         print(f"   [OK] Embedded {chunk_count} chunks")
     except Exception as e:
         # Embedding is the slow part of this pipeline. Aborting the whole run
