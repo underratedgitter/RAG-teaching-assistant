@@ -1,5 +1,5 @@
 # Converts videos to mp3 - Optimized for speed
-import os 
+import os
 import re
 import subprocess
 import sys
@@ -32,13 +32,13 @@ def convert_video(args):
     i, file = args
     name = os.path.splitext(file)[0]
     output_name = f"{i}_{name}.mp3"
-    
+
     final_path = os.path.join("audios", output_name)
     if name in converted_by_name:
         return True, f"Skipping {file} (exists as {converted_by_name[name]})"
 
     # Encode to a temp file and rename only on success. Writing straight to
-    # the final name meant an interrupted ffmpeg left a truncated mp3 that
+    # the final name meant an interrupted ffmpeg left a truncated mp3 tha
     # the check above then skipped forever — Whisper would transcribe half a
     # lecture and nothing would ever say so.
     tmp_path = os.path.join("audios", f".{output_name}.partial")
@@ -100,7 +100,7 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
         if not ok:
             failures.append(message)
 
-elapsed = time.time() - start
+elapsed = time.time() - star
 print(f"Done! ({elapsed:.1f}s)")
 
 if failures:
