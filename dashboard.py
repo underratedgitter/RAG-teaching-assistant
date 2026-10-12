@@ -12,7 +12,6 @@ import numpy as np
 import joblib
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ── Retrieval tuning ─────────────────────────────────────────────────────────
 # Raise TOP_K to give the model more context at the cost of a longer prompt;
@@ -30,7 +29,7 @@ def _has_gpu_offload():
     """Whether Ollama can offload layers to a GPU on this machine.
 
     Ollama uses Metal on Apple Silicon and CUDA/ROCm on Linux and Windows.
-    An Intel Mac has neither, so asking for 99 GPU layers there is at bes
+    An Intel Mac has neither, so asking for 99 GPU layers there is at best
     ignored — it is not a portable default.
     """
     if sys.platform == "darwin":
@@ -45,7 +44,7 @@ if _has_gpu_offload():
 # RAG Teaching Assistant Dashboard Interface
 class RAGDashboard:
     def __init__(self, root):
-        self.root = roo
+        self.root = root
         self.root.title("RAG Teaching Assistant")
         self.root.geometry("700x650")
 
@@ -78,7 +77,7 @@ class RAGDashboard:
             # Auto-start Ollama if not running
             threading.Thread(target=self._ensure_ollama_running, daemon=True).start()
 
-            # Pre-warm Ollama models in background so first query is fas
+            # Pre-warm Ollama models in background so first query is fast
             threading.Thread(target=self._warm_models, daemon=True).start()
 
         except Exception as e:
@@ -246,8 +245,8 @@ class RAGDashboard:
                 json={"model": ANSWER_MODEL, "prompt": "hi", "stream": False,
                       "options": {"num_predict": 1}}, timeout=30)
             self.log_safe("✓ Ollama models warmed up - ready for queries.")
-        except Exception as e:
-            self.log_safe(f"⚠ Model warm-up in progress... (this is normal)")
+        except Exception:
+            self.log_safe("⚠ Model warm-up in progress... (this is normal)")
 
     def log(self, text):
         """Add text to terminal"""
@@ -273,7 +272,7 @@ class RAGDashboard:
                     if os.path.exists(matrix_path):
                         try:
                             self.embedding_matrix = np.load(matrix_path)
-                        except Exception as e:
+                        except Exception:
                             # Regenerate if matrix is corrupted
                             self.embedding_matrix = np.vstack(self.df['embedding'].values)
                     else:
@@ -284,11 +283,11 @@ class RAGDashboard:
                     if self.embedding_matrix.shape[0] != len(self.df):
                         self.embedding_matrix = np.vstack(self.df['embedding'].values)
                     self._prepare_matrix()
-                except Exception as e:
+                except Exception:
                     self.df = None
                     self.embedding_matrix = None
                     # Silent fail - embeddings will be regenerated when videos are processed
-        except Exception as e:
+        except Exception:
             self.df = None
             self.embedding_matrix = None
 
@@ -505,7 +504,10 @@ Instructions:
             self.root.after(0, lambda: self._show_response("Error: Cannot connect to Ollama. Start it with: ollama serve"))
         except Exception as e:
             self.log_safe(f"Error: {e}")
-            self.root.after(0, lambda: self._show_response(f"Error: {e}"))
+            # Bind the message now: Python unbinds `e` when the except block
+            # ends, before Tk runs the callback.
+            message = f"Error: {e}"
+            self.root.after(0, lambda: self._show_response(message))
 
     def _show_response(self, text):
         self.response_text.delete("1.0", "end")

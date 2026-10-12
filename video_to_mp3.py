@@ -38,7 +38,7 @@ def convert_video(args):
         return True, f"Skipping {file} (exists as {converted_by_name[name]})"
 
     # Encode to a temp file and rename only on success. Writing straight to
-    # the final name meant an interrupted ffmpeg left a truncated mp3 tha
+    # the final name meant an interrupted ffmpeg left a truncated mp3 that
     # the check above then skipped forever — Whisper would transcribe half a
     # lecture and nothing would ever say so.
     tmp_path = os.path.join("audios", f".{output_name}.partial")
@@ -100,7 +100,7 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
         if not ok:
             failures.append(message)
 
-elapsed = time.time() - star
+elapsed = time.time() - start
 print(f"Done! ({elapsed:.1f}s)")
 
 if failures:

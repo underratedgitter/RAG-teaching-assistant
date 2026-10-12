@@ -1,5 +1,5 @@
 """Tests for merge_segments — the chunking that retrieval quality depends on."""
-import sys, types
+import types
 from pathlib import Path
 
 # Import merge_segments without running the module's top-level pipeline,
