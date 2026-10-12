@@ -38,7 +38,7 @@ print(f"Using: {device.upper()}")
 _default_compute = "float16" if device == "cuda" else "int8"
 _compute = os.environ.get("WHISPER_COMPUTE_TYPE", _default_compute)
 
-# Model size is the biggest lever on transcription time, and the righ
+# Model size is the biggest lever on transcription time, and the right
 # default depends on the hardware. Override with WHISPER_MODEL=small|base|tiny.
 _default_model = "small" if device == "cuda" else "base"
 _preferred = os.environ.get("WHISPER_MODEL", _default_model)
@@ -52,7 +52,7 @@ if device == "cuda":
 else:
     _compute_ladder = [_compute] + [c for c in ("int8", "float32") if c != _compute]
 
-# Whisper decoding is sequential, so extra threads only help the encoder — bu
+# Whisper decoding is sequential, so extra threads only help the encoder — but
 # that is where a CPU run spends most of its time.
 _cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 
@@ -148,7 +148,7 @@ def transcribe_with_fallback(path, use_vad=None):
     """Transcribe, dropping VAD if VAD is what broke.
 
     VAD is a second model in front of the real one, with its own weights to
-    load. When it fails the recording is still perfectly transcribable — jus
+    load. When it fails the recording is still perfectly transcribable — just
     without the silence-skipping — so a failure here costs speed, not the
     lecture.
     """
@@ -192,7 +192,7 @@ for idx, audio in enumerate(audios, 1):
         # Validate file exists and is readable
         audio_path = f"audios/{audio}"
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-            print(f"  [!] Invalid audio file (empty or missing)")
+            print("  [!] Invalid audio file (empty or missing)")
             results["failed"] += 1
             continue
 
@@ -217,13 +217,13 @@ for idx, audio in enumerate(audios, 1):
                 continue
 
         if not chunks:
-            print(f"  [!] No valid chunks extracted")
+            print("  [!] No valid chunks extracted")
             results["failed"] += 1
             continue
 
         # Save with error handling
         try:
-            # Write to a temp file and rename, so an interrupted save canno
+            # Write to a temp file and rename, so an interrupted save cannot
             # leave a half-written transcript that later runs treat as done.
             tmp_path = f"jsons/.{json_filename}.partial"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -236,7 +236,7 @@ for idx, audio in enumerate(audios, 1):
                 os.fsync(f.fileno())
             os.replace(tmp_path, f"jsons/{json_filename}")
 
-            elapsed = time.time() - star
+            elapsed = time.time() - start
             spoken = getattr(info, "duration", 0) or 0
             audio_seconds += spoken
             speed = f", {spoken / elapsed:.0f}x realtime" if elapsed > 0 and spoken else ""

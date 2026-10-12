@@ -5,7 +5,6 @@ position, so a reordered result silently attaches every answer to the wrong
 timestamp.
 """
 import os
-import sys
 import types
 from pathlib import Path
 
@@ -119,6 +118,30 @@ def test_single_batch_path_still_works(monkeypatch):
 def test_empty_input_returns_empty(monkeypatch):
     m = load_module(monkeypatch)
     assert m["create_embedding"]([]) == []
+
+
+def test_failed_batch_falls_back_to_one_at_a_time(monkeypatch):
+    """A rejected batch is retried per text, and the vectors keep their order."""
+    m = load_module(monkeypatch)
+    requests = m["requests"]
+
+    class FakeResponse:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def raise_for_status(self):
+            if len(self.texts) > 1:
+                raise requests.exceptions.HTTPError("batch too large")
+
+        def json(self):
+            return {"embeddings": [[float(len(t))] for t in self.texts]}
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            return FakeResponse(json["input"])
+
+    m["session"] = FakeSession()
+    assert m["_embed_batch"](["a", "bb", "ccc"]) == [[1.0], [2.0], [3.0]]
 
 
 def test_a_failing_batch_propagates(monkeypatch):

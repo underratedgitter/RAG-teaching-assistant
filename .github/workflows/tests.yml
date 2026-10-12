@@ -17,12 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12']
+        python-version: ['3.11', '3.12', '3.13']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -31,7 +31,14 @@ jobs:
       # selection by reading the source directly, so faster-whisper — the
       # one heavy dependency left — is not installed here.
       - name: Install test dependencies
-        run: pip install pytest joblib numpy pandas requests
+        run: pip install pytest joblib numpy pandas requests ruff
+
+      # The scripts are mostly exercised end to end against Ollama and
+      # ffmpeg, which CI does not have, so pyflakes is the net for names that
+      # only break at runtime (a refactor once left `star`, `ou` and
+      # `chunk_coun` behind and every test still passed).
+      - name: Check for undefined names and other pyflakes errors
+        run: ruff check . --select F
 
       - name: Run tests
         run: pytest tests/ -q

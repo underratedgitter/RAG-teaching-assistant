@@ -60,7 +60,7 @@ def save_cached(json_file, texts, embeddings):
 
 # Session with retry logic and connection pooling.
 #
-# allowed_methods matters: urllib3 only retries idempotent verbs by defaul
+# allowed_methods matters: urllib3 only retries idempotent verbs by default
 # (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
 # retry block did nothing — every embedding call had zero retries.
 session = requests.Session()
@@ -97,7 +97,7 @@ def _embed_batch(batch):
                 timeout=120)
             r.raise_for_status()
             out.extend(r.json()["embeddings"])
-        return ou
+        return out
 
 
 def create_embedding(text_list, batch_size=128):
@@ -129,7 +129,7 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
 
     The buffer holds whole segments rather than bare strings, so a chunk's
     start/end span every segment it contains — including the overlap carried
-    over from the previous chunk. Previously `start` was reset to the segmen
+    over from the previous chunk. Previously `start` was reset to the segment
     that triggered the flush, which put every overlapped chunk's timestamp
     ~12 seconds later than the words it actually quotes.
 
@@ -211,7 +211,7 @@ for json_idx, json_file in enumerate(jsons, 1):
             save_cached(json_file, texts, embeddings)
         else:
             cached_files += 1
-            print(f"   [=] Reusing cached embeddings")
+            print("   [=] Reusing cached embeddings")
 
         for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
@@ -221,7 +221,7 @@ for json_idx, json_file in enumerate(jsons, 1):
 
         # Counted only once the chunks are actually embedded and kept, so a
         # skipped file cannot inflate the total.
-        total_chunks += chunk_coun
+        total_chunks += chunk_count
         print(f"   [OK] Embedded {chunk_count} chunks")
     except Exception as e:
         # Embedding is the slow part of this pipeline. Aborting the whole run
@@ -243,7 +243,7 @@ print(f"\n[>] Creating DataFrame with {len(my_dicts)} total chunks...")
 df = pd.DataFrame.from_records(my_dicts)
 
 # Pre-compute the embedding matrix for faster queries
-print(f"[*] Saving embeddings...")
+print("[*] Saving embeddings...")
 joblib.dump(df, 'embeddings.joblib', compress=3)
 
 # Also save the pre-computed matrix for faster similarity search (float32 for memory efficiency)
@@ -251,7 +251,7 @@ embedding_matrix = np.vstack(df['embedding'].values).astype(np.float32)
 np.save('embedding_matrix.npy', embedding_matrix)
 
 elapsed = time.time() - start_time
-print(f"\n[SUCCESS] Complete!")
+print("\n[SUCCESS] Complete!")
 print(f"   Files embedded: {len(jsons) - len(failed)}/{len(jsons)}"
       f"  ({cached_files} reused from cache)")
 print(f"   Total chunks: {total_chunks}")
