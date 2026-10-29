@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import platform
+import json
 import numpy as np
 import joblib
 import requests
@@ -38,6 +39,16 @@ def _has_gpu_offload():
 
 
 GENERATION_OPTIONS = {"num_predict": 300}
+
+
+def _matrix_matches_dataframe(df, meta):
+    """Whether a matrix sidecar belongs to this dataframe's corpus."""
+    if not isinstance(meta, dict):
+        return False
+    corpus_id = getattr(df, "attrs", {}).get("corpus_id")
+    return bool(corpus_id) and meta.get("corpus_id") == corpus_id and meta.get("rows") == len(df)
+
+
 if _has_gpu_offload():
     GENERATION_OPTIONS["num_gpu"] = 99
 
@@ -261,32 +272,45 @@ class RAGDashboard:
         self.terminal.delete("1.0", "end")
 
     def load_embeddings(self):
-        """Load cached embeddings with robust error handling"""
+        """Load cached embeddings, rejecting a matrix from another corpus."""
         embeddings_path = os.path.join(self.base_dir, "embeddings.joblib")
         matrix_path = os.path.join(self.base_dir, "embedding_matrix.npy")
+        meta_path = os.path.join(self.base_dir, "embedding_matrix.meta.json")
 
         try:
-            if os.path.exists(embeddings_path):
+            if not os.path.exists(embeddings_path):
+                return
+
+            self.df = joblib.load(embeddings_path)
+            meta = {}
+            if os.path.exists(meta_path):
                 try:
-                    self.df = joblib.load(embeddings_path)
-                    if os.path.exists(matrix_path):
-                        try:
-                            self.embedding_matrix = np.load(matrix_path)
-                        except Exception:
-                            # Regenerate if matrix is corrupted
-                            self.embedding_matrix = np.vstack(self.df['embedding'].values)
-                    else:
-                        self.embedding_matrix = np.vstack(self.df['embedding'].values)
-                    # A run that failed between writing embeddings.joblib and
-                    # embedding_matrix.npy leaves a matrix from an older corpus;
-                    # its row numbers would then point at the wrong chunks.
-                    if self.embedding_matrix.shape[0] != len(self.df):
-                        self.embedding_matrix = np.vstack(self.df['embedding'].values)
-                    self._prepare_matrix()
+                    with open(meta_path, encoding="utf-8") as handle:
+                        meta = json.load(handle)
+                except (OSError, ValueError, UnicodeDecodeError):
+                    meta = {}
+
+            matrix_ok = False
+            if os.path.exists(matrix_path) and _matrix_matches_dataframe(self.df, meta):
+                try:
+                    matrix = np.load(matrix_path)
+                    expected_dim = len(self.df["embedding"].iloc[0])
+                    if (
+                        matrix.ndim == 2
+                        and matrix.shape[0] == len(self.df)
+                        and matrix.shape[1] == expected_dim
+                    ):
+                        self.embedding_matrix = matrix
+                        matrix_ok = True
                 except Exception:
-                    self.df = None
-                    self.embedding_matrix = None
-                    # Silent fail - embeddings will be regenerated when videos are processed
+                    matrix_ok = False
+
+            if not matrix_ok:
+                # The dataframe is authoritative: rebuild the matrix from its
+                # own embedding column rather than trusting a stale .npy file.
+                self.embedding_matrix = np.vstack(self.df["embedding"].values)
+
+            self._prepare_matrix()
         except Exception:
             self.df = None
             self.embedding_matrix = None

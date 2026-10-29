@@ -99,6 +99,107 @@ def test_zero_byte_audio_is_not_treated_as_converted(tmp_path, monkeypatch):
     assert os.path.getsize(empty) == 0   # the guard video_to_mp3 now applies
 
 
+# ── video_to_mp3: a replaced video must invalidate its audio/transcript ─────
+
+def _video_helpers(tmp_path, monkeypatch):
+    """Load video_to_mp3's helper functions without running the pipeline."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "audios").mkdir(exist_ok=True)
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    src = (ROOT / "video_to_mp3.py").read_text()
+    head = src[: src.index("existing_audios =")]
+    ns = {"__name__": "video_to_mp3_helpers"}
+    exec(compile(head, "video_to_mp3.py", "exec"), ns)
+    return ns
+
+
+def test_audio_without_sidecar_uses_mtime_fallback(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    video = tmp_path / "videos" / "lecture.mp4"
+    audio = tmp_path / "audios" / "1_lecture.mp3"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    os.utime(audio, (video.stat().st_atime + 10, video.stat().st_mtime + 10))
+    assert h["_audio_is_current"](str(audio), str(video)) is True
+
+    os.utime(audio, (video.stat().st_atime - 10, video.stat().st_mtime - 10))
+    assert h["_audio_is_current"](str(audio), str(video)) is False
+
+
+def test_replaced_video_invalidates_audio_and_transcript(tmp_path, monkeypatch):
+    """Same filename with new bytes is a new lecture, not a finished one."""
+    h = _video_helpers(tmp_path, monkeypatch)
+    video = tmp_path / "videos" / "lecture.mp4"
+    audio = tmp_path / "audios" / "1_lecture.mp3"
+    transcript = tmp_path / "jsons" / "1_lecture.mp3.json"
+    transcript.parent.mkdir()
+    video.write_bytes(b"first recording")
+    audio.write_bytes(b"audio from the first recording")
+    transcript.write_text(json.dumps({"chunks": [{"text": "old"}]}))
+
+    h["_write_source_sidecar"](str(audio), str(video))
+    assert h["_audio_is_current"](str(audio), str(video)) is True
+
+    video.write_bytes(b"replacement recording, different size")
+    assert h["_audio_is_current"](str(audio), str(video)) is False
+
+    h["_remove_transcript"]("1_lecture.mp3")
+    assert not transcript.exists(), "stale transcript would be paired with new audio"
+
+
+# ── preprocess_json/dashboard: artifacts must belong to the same corpus ────
+
+def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import numpy as np
+    import pandas as pd
+
+    src = (ROOT / "preprocess_json.py").read_text()
+    head = src[: src.index('print("="*50)')]
+    ns = {"__name__": "pp"}
+    monkeypatch.setenv("EMBED_MODEL", "nomic-embed-text")
+    exec(compile(head, "preprocess_json.py", "exec"), ns)
+
+    df = pd.DataFrame.from_records(
+        [
+            {"text": "one", "embedding": np.array([1.0, 0.0], dtype=np.float32)},
+            {"text": "two", "embedding": np.array([0.0, 1.0], dtype=np.float32)},
+        ]
+    )
+    corpus_id = ns["cache_key"](["one", "two"])
+    ns["save_artifacts"](df, corpus_id)
+
+    import joblib
+
+    loaded = joblib.load("embeddings.joblib")
+    assert loaded.attrs["corpus_id"] == corpus_id
+    assert np.load("embedding_matrix.npy").shape == (2, 2)
+    assert json.loads(Path("embedding_matrix.meta.json").read_text()) == {
+        "corpus_id": corpus_id,
+        "rows": 2,
+        "model": "nomic-embed-text",
+    }
+
+
+def test_matrix_from_another_corpus_is_rejected():
+    src = (ROOT / "dashboard.py").read_text()
+    start = src.index("def _matrix_matches_dataframe")
+    end = src.index("if _has_gpu_offload()")
+    ns = {}
+    exec(compile(src[start:end], "dashboard.py", "exec"), ns)
+
+    class Frame:
+        attrs = {"corpus_id": "new"}
+
+        def __len__(self):
+            return 2
+
+    matches = ns["_matrix_matches_dataframe"]
+    assert matches(Frame(), {"corpus_id": "new", "rows": 2}) is True
+    assert matches(Frame(), {"corpus_id": "old", "rows": 2}) is False
+    assert matches(Frame(), {}) is False
+
+
 # ── the scripts stay importable/parseable ───────────────────────────────────
 
 @pytest.mark.parametrize(

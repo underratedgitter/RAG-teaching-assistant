@@ -1,4 +1,5 @@
 # Converts videos to mp3 - Optimized for speed
+import json
 import os
 import re
 import subprocess
@@ -7,6 +8,79 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 os.makedirs("audios", exist_ok=True)
+
+
+def _source_signature(source_path):
+    """Identity of the video a converted audio came from."""
+    stat = os.stat(source_path)
+    return {
+        "source": os.path.basename(source_path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _sidecar_path(audio_path):
+    return f"{audio_path}.source.json"
+
+
+def _read_source_sidecar(audio_path):
+    try:
+        with open(_sidecar_path(audio_path), encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _write_source_sidecar(audio_path, source_path):
+    """Record the source signature atomically after a successful encode."""
+    target = _sidecar_path(audio_path)
+    tmp = f"{target}.partial"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(_source_signature(source_path), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _audio_is_current(audio_path, source_path):
+    """Whether the existing mp3 was produced from the current video file.
+
+    New conversions carry a sidecar with the source size and mtime. Audio made
+    before sidecars existed falls back to an mtime comparison, so replacing a
+    video with a newer file triggers a re-encode instead of reusing old audio.
+    """
+    try:
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            return False
+        sidecar = _read_source_sidecar(audio_path)
+        if sidecar is not None:
+            return sidecar == _source_signature(source_path)
+        return os.path.getmtime(audio_path) >= os.path.getmtime(source_path)
+    except OSError:
+        return False
+
+
+def _remove_transcript(audio_name):
+    """Drop the old transcript when its audio is replaced."""
+    for path in (
+        os.path.join("jsons", f"{audio_name}.json"),
+        os.path.join("jsons", f".{audio_name}.json.partial"),
+    ):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 existing_audios = set(os.listdir("audios"))
 
 # Audio names carry a position prefix ("3_Lecture.mp3") taken from the sorted
@@ -28,14 +102,14 @@ files = [f for f in os.listdir("videos") if f.endswith(('.mp4', '.avi', '.mkv', 
 print(f"Found {len(files)} video files")
 
 def convert_video(args):
-    """Convert a single video file"""
-    i, file = args
+    """Convert a single video file, replacing stale audio when needed."""
+    output_name, file = args
     name = os.path.splitext(file)[0]
-    output_name = f"{i}_{name}.mp3"
 
     final_path = os.path.join("audios", output_name)
-    if name in converted_by_name:
-        return True, f"Skipping {file} (exists as {converted_by_name[name]})"
+    source_path = os.path.join("videos", file)
+    if _audio_is_current(final_path, source_path):
+        return True, f"Skipping {file} (up to date as {output_name})"
 
     # Encode to a temp file and rename only on success. Writing straight to
     # the final name meant an interrupted ffmpeg left a truncated mp3 that
@@ -58,7 +132,14 @@ def convert_video(args):
         )
 
         if result.returncode == 0 and os.path.getsize(tmp_path) > 0:
+            if os.path.exists(final_path):
+                # The video changed; the transcript from the old audio is stale.
+                _remove_transcript(output_name)
             os.replace(tmp_path, final_path)   # atomic on the same filesystem
+            try:
+                _write_source_sidecar(final_path, source_path)
+            except OSError as exc:
+                print(f"   [WARNING] Could not record source signature for {output_name}: {exc}")
             return True, f"Created {output_name}"
 
         _cleanup(tmp_path)
@@ -88,10 +169,15 @@ failures = []
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     jobs = []
     for f in sorted(files):
-        if os.path.splitext(f)[0] in converted_by_name:
-            jobs.append((0, f))            # skipped inside convert_video
+        name = os.path.splitext(f)[0]
+        existing = converted_by_name.get(name)
+        if existing:
+            # Reuse the existing lecture number; convert_video decides whether
+            # the audio is current or needs to be replaced.
+            jobs.append((existing, f))
         else:
-            jobs.append((next_number, f))
+            output_name = f"{next_number}_{name}.mp3"
+            jobs.append((output_name, f))
             next_number += 1
     futures = [executor.submit(convert_video, job) for job in jobs]
     for future in as_completed(futures):

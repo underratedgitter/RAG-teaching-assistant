@@ -58,6 +58,45 @@ def save_cached(json_file, texts, embeddings):
         except OSError:
             pass
 
+
+def save_artifacts(df, corpus_id):
+    """Write the dataframe and matrix as one validated pair.
+
+    The dataframe carries the corpus id in ``df.attrs``; the matrix sidecar
+    records the same id. The dashboard refuses a matrix whose id does not match
+    the dataframe, so a crash between the two writes cannot leave row numbers
+    pointing at the wrong chunks.
+    """
+    df.attrs["corpus_id"] = corpus_id
+    tmp_df = "embeddings.joblib.partial"
+    tmp_matrix = "embedding_matrix.npy.partial"
+    tmp_meta = "embedding_matrix.meta.json.partial"
+
+    try:
+        joblib.dump(df, tmp_df, compress=3)
+        os.replace(tmp_df, "embeddings.joblib")
+
+        matrix = np.vstack(df["embedding"].values).astype(np.float32)
+        with open(tmp_matrix, "wb") as handle:
+            np.save(handle, matrix)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_matrix, "embedding_matrix.npy")
+
+        meta = {"corpus_id": corpus_id, "rows": len(df), "model": EMBED_MODEL}
+        with open(tmp_meta, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_meta, "embedding_matrix.meta.json")
+    finally:
+        for path in (tmp_df, tmp_matrix, tmp_meta):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
 # Session with retry logic and connection pooling.
 #
 # allowed_methods matters: urllib3 only retries idempotent verbs by default
@@ -242,13 +281,13 @@ if not my_dicts:
 print(f"\n[>] Creating DataFrame with {len(my_dicts)} total chunks...")
 df = pd.DataFrame.from_records(my_dicts)
 
-# Pre-compute the embedding matrix for faster queries
-print("[*] Saving embeddings...")
-joblib.dump(df, 'embeddings.joblib', compress=3)
+# Tie the dataframe and the matrix together. The id covers every chunk text
+# and the embedding model, so a matrix from another run cannot be mistaken for
+# this one even when both happen to have the same number of rows.
+corpus_id = cache_key([chunk["text"] for chunk in my_dicts])
 
-# Also save the pre-computed matrix for faster similarity search (float32 for memory efficiency)
-embedding_matrix = np.vstack(df['embedding'].values).astype(np.float32)
-np.save('embedding_matrix.npy', embedding_matrix)
+print("[*] Saving embeddings...")
+save_artifacts(df, corpus_id)
 
 elapsed = time.time() - start_time
 print("\n[SUCCESS] Complete!")
