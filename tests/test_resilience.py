@@ -147,6 +147,154 @@ def test_replaced_video_invalidates_audio_and_transcript(tmp_path, monkeypatch):
     assert not transcript.exists(), "stale transcript would be paired with new audio"
 
 
+# ── video_to_mp3: same stem in different containers is a different lecture ──
+
+def test_same_stem_videos_get_distinct_audio_names(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    files = ["lecture.mp4", "lecture.mov"]
+    for name in files:
+        (tmp_path / "videos" / name).write_bytes(b"video")
+
+    jobs = h["_plan_conversions"](files, set())
+    by_video = {source: output for output, source in jobs}
+
+    assert by_video["lecture.mp4"] != by_video["lecture.mov"]
+    assert by_video["lecture.mp4"].endswith("_lecture.mp4.mp3")
+    assert by_video["lecture.mov"].endswith("_lecture.mov.mp3")
+    assert len(set(by_video.values())) == 2
+
+
+def test_same_stem_videos_are_stable_on_repeated_runs(tmp_path, monkeypatch):
+    """A second run must reuse both outputs verbatim, not renumber them."""
+    h = _video_helpers(tmp_path, monkeypatch)
+    files = ["lecture.mp4", "lecture.mov"]
+    for name in files:
+        (tmp_path / "videos" / name).write_bytes(b"video")
+
+    first = h["_plan_conversions"](files, set())
+    for output_name, _ in first:
+        (tmp_path / "audios" / output_name).write_bytes(b"audio")
+
+    second = h["_plan_conversions"](files, set(os.listdir(tmp_path / "audios")))
+    assert second == first
+
+
+def test_legacy_audio_is_reused_for_the_only_video_with_that_stem(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    (tmp_path / "videos" / "lecture.mp4").write_bytes(b"video")
+    (tmp_path / "audios" / "7_lecture.mp3").write_bytes(b"legacy audio")
+
+    jobs = h["_plan_conversions"](["lecture.mp4"], {"7_lecture.mp3"})
+    assert jobs == [("7_lecture.mp3", "lecture.mp4")]
+
+
+def test_legacy_audio_is_not_shared_by_two_same_stem_videos(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    files = ["lecture.mp4", "lecture.mov"]
+    for name in files:
+        (tmp_path / "videos" / name).write_bytes(b"video")
+    (tmp_path / "audios" / "7_lecture.mp3").write_bytes(b"ambiguous audio")
+
+    jobs = h["_plan_conversions"](files, {"7_lecture.mp3"})
+    outputs = {source: output for output, source in jobs}
+
+    assert "7_lecture.mp3" not in outputs.values(), \
+        "a stem-only mp3 cannot be attributed when two videos share the stem"
+    assert outputs["lecture.mp4"] != outputs["lecture.mov"]
+    assert outputs["lecture.mp4"].endswith("_lecture.mp4.mp3")
+    assert outputs["lecture.mov"].endswith("_lecture.mov.mp3")
+
+    # The fresh names are stable on the next run, even with the legacy file
+    # still sitting in audios/.
+    for output_name, _ in jobs:
+        (tmp_path / "audios" / output_name).write_bytes(b"audio")
+    again = h["_plan_conversions"](files, set(os.listdir(tmp_path / "audios")))
+    assert again == jobs
+
+
+def test_legacy_audio_sidecar_pins_it_to_one_same_stem_video(tmp_path, monkeypatch):
+    """If the legacy mp3 was matched before, its sidecar breaks the tie."""
+    h = _video_helpers(tmp_path, monkeypatch)
+    files = ["lecture.mp4", "lecture.mov"]
+    for name in files:
+        (tmp_path / "videos" / name).write_bytes(b"video")
+    legacy = tmp_path / "audios" / "7_lecture.mp3"
+    legacy.write_bytes(b"legacy audio")
+    h["_write_source_sidecar"](
+        str(legacy), str(tmp_path / "videos" / "lecture.mp4")
+    )
+
+    outputs = {source: output for output, source in h["_plan_conversions"](files, {"7_lecture.mp3"})}
+    assert outputs["lecture.mp4"] == "7_lecture.mp3"
+    assert outputs["lecture.mov"] != "7_lecture.mp3"
+
+
+def test_ensure_source_sidecar_records_legacy_audio_provenance(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    video = tmp_path / "videos" / "lecture.mp4"
+    audio = tmp_path / "audios" / "7_lecture.mp3"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"legacy audio")
+
+    h["_ensure_source_sidecar"](str(audio), str(video))
+    sidecar = h["_read_source_sidecar"](str(audio))
+    assert sidecar["source"] == "lecture.mp4"
+
+
+def test_remove_transcript_only_removes_the_replaced_sources_transcript(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    jsons = tmp_path / "jsons"
+    jsons.mkdir()
+    mp4 = jsons / "1_lecture.mp4.mp3.json"
+    mov = jsons / "2_lecture.mov.mp3.json"
+    mp4_partial = jsons / ".1_lecture.mp4.mp3.json.partial"
+    mov_partial = jsons / ".2_lecture.mov.mp3.json.partial"
+    for path in (mp4, mov, mp4_partial, mov_partial):
+        path.write_text("{}")
+
+    h["_remove_transcript"]("1_lecture.mp4.mp3")
+
+    assert not mp4.exists() and not mp4_partial.exists()
+    assert mov.exists() and mov_partial.exists(), "the other video's transcript was deleted"
+
+
+def test_ambiguous_legacy_corpus_is_preserved_outside_active_inputs(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    audio = tmp_path / 'audios' / '7_lecture.mp3'
+    audio.write_bytes(b'old audio')
+    (tmp_path / 'jsons').mkdir()
+    transcript = tmp_path / 'jsons' / '7_lecture.mp3.json'
+    transcript.write_text('{"chunks": [{"text": "old"}]}')
+    h['_quarantine_ambiguous_audio'](['lecture.mp4', 'lecture.mov'], {audio.name})
+    assert not audio.exists() and not transcript.exists()
+    backup = list((tmp_path / 'audios' / '.ambiguous').iterdir())[0]
+    assert (backup / audio.name).read_bytes() == b'old audio'
+    assert (backup / transcript.name).exists()
+
+
+def test_actual_conversion_jobs_do_not_share_outputs(tmp_path, monkeypatch):
+    import runpy
+    import subprocess
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'videos').mkdir()
+    for filename in ('lecture.mp4', 'lecture.mov'):
+        (tmp_path / 'videos' / filename).write_bytes(filename.encode())
+    calls = []
+    def fake_ffmpeg(args, **kwargs):
+        from types import SimpleNamespace
+        calls.append(args)
+        assert args[-3:-1] == ['-f', 'mp3']
+        Path(args[-1]).write_bytes(Path(args[args.index('-i') + 1]).read_bytes())
+        return SimpleNamespace(returncode=0, stderr=b'')
+    monkeypatch.setattr(subprocess, 'run', fake_ffmpeg)
+    runpy.run_path(str(ROOT / 'video_to_mp3.py'))
+    outputs = list((tmp_path / 'audios').glob('*.mp3'))
+    assert len(outputs) == 2
+    assert {output.read_bytes() for output in outputs} == {b'lecture.mp4', b'lecture.mov'}
+    runpy.run_path(str(ROOT / 'video_to_mp3.py'))
+    assert len(calls) == 2, 'second run must reuse each source independently'
+
+
 # ── preprocess_json/dashboard: artifacts must belong to the same corpus ────
 
 def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
@@ -173,6 +321,8 @@ def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
 
     loaded = joblib.load("embeddings.joblib")
     assert loaded.attrs["corpus_id"] == corpus_id
+    assert loaded.attrs["embedding_model"] == "nomic-embed-text"
+    assert loaded.attrs["model"] == "nomic-embed-text"
     assert np.load("embedding_matrix.npy").shape == (2, 2)
     assert json.loads(Path("embedding_matrix.meta.json").read_text()) == {
         "corpus_id": corpus_id,

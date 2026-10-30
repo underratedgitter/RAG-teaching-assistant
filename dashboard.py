@@ -41,12 +41,45 @@ def _has_gpu_offload():
 GENERATION_OPTIONS = {"num_predict": 300}
 
 
-def _matrix_matches_dataframe(df, meta):
-    """Whether a matrix sidecar belongs to this dataframe's corpus."""
+def _recorded_models(df, meta):
+    """Model identities recorded on the dataframe and the matrix sidecar."""
+    attrs = getattr(df, "attrs", None) or {}
+    df_model = attrs.get("embedding_model") or attrs.get("model")
+    meta_model = meta.get("model") if isinstance(meta, dict) else None
+    return df_model, meta_model
+
+
+def _dataframe_embeddings_match_model(df, meta, current_model):
+    """Whether the dataframe's embedding column came from ``current_model``.
+
+    A dataframe with no model identity is untrusted: it could have been
+    produced by any model, and querying it with the current one silently
+    compares vectors from different embedding spaces. Artifacts written before
+    the dataframe carried this metadata can still prove their identity through
+    the matrix sidecar, which has recorded the model since it was introduced.
+    """
+    df_model, meta_model = _recorded_models(df, meta)
+    if df_model is not None:
+        return df_model == current_model
+    corpus_id = getattr(df, "attrs", {}).get("corpus_id")
+    return bool(corpus_id) and meta.get("corpus_id") == corpus_id and meta_model == current_model
+
+
+def _matrix_matches_dataframe(df, meta, current_model=None):
+    """Whether a matrix sidecar belongs to this dataframe's corpus and model.
+
+    ``current_model`` is optional only for callers that inspect legacy
+    artifacts; the dashboard always passes it, so a matrix with no recorded
+    model is rejected rather than trusted by default.
+    """
     if not isinstance(meta, dict):
         return False
     corpus_id = getattr(df, "attrs", {}).get("corpus_id")
-    return bool(corpus_id) and meta.get("corpus_id") == corpus_id and meta.get("rows") == len(df)
+    if not (bool(corpus_id) and meta.get("corpus_id") == corpus_id and meta.get("rows") == len(df)):
+        return False
+    if current_model is None:
+        return True
+    return meta.get("model") == current_model
 
 
 if _has_gpu_offload():
@@ -272,7 +305,7 @@ class RAGDashboard:
         self.terminal.delete("1.0", "end")
 
     def load_embeddings(self):
-        """Load cached embeddings, rejecting a matrix from another corpus."""
+        """Load cached embeddings, rejecting another corpus or embedding model."""
         embeddings_path = os.path.join(self.base_dir, "embeddings.joblib")
         matrix_path = os.path.join(self.base_dir, "embedding_matrix.npy")
         meta_path = os.path.join(self.base_dir, "embedding_matrix.meta.json")
@@ -290,8 +323,30 @@ class RAGDashboard:
                 except (OSError, ValueError, UnicodeDecodeError):
                     meta = {}
 
+            if not _dataframe_embeddings_match_model(self.df, meta, EMBED_MODEL):
+                # Never mix vectors from two models. The dataframe's own
+                # embeddings are unusable here, and rebuilding the matrix from
+                # them would just preserve the mismatch, so discard both: the
+                # next Process Videos run re-embeds from the transcripts.
+                df_model, meta_model = _recorded_models(self.df, meta)
+                recorded = df_model or meta_model or "unknown model"
+                print(
+                    f"[WARNING] Cached embeddings were created with {recorded!r}, "
+                    f"not {EMBED_MODEL!r}; ignoring them so preprocessing can rebuild."
+                )
+                self.df = None
+                self.embedding_matrix = None
+                return
+
+            # Older artifacts have the identity only in the sidecar. Stamp the
+            # dataframe in memory so later checks do not fall back again.
+            if getattr(self.df, "attrs", None) is not None:
+                self.df.attrs.setdefault("embedding_model", EMBED_MODEL)
+
             matrix_ok = False
-            if os.path.exists(matrix_path) and _matrix_matches_dataframe(self.df, meta):
+            if os.path.exists(matrix_path) and _matrix_matches_dataframe(
+                self.df, meta, EMBED_MODEL
+            ):
                 try:
                     matrix = np.load(matrix_path)
                     expected_dim = len(self.df["embedding"].iloc[0])

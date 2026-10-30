@@ -62,12 +62,17 @@ def save_cached(json_file, texts, embeddings):
 def save_artifacts(df, corpus_id):
     """Write the dataframe and matrix as one validated pair.
 
-    The dataframe carries the corpus id in ``df.attrs``; the matrix sidecar
-    records the same id. The dashboard refuses a matrix whose id does not match
-    the dataframe, so a crash between the two writes cannot leave row numbers
-    pointing at the wrong chunks.
+    The dataframe carries the corpus id and embedding model in ``df.attrs``;
+    the matrix sidecar records the same identity. The dashboard refuses
+    artifacts whose corpus or model does not match, so a crash between writes
+    cannot leave row numbers pointing at the wrong chunks, and changing
+    EMBED_MODEL cannot silently reuse vectors from the previous model.
     """
     df.attrs["corpus_id"] = corpus_id
+    # "embedding_model" is the canonical attr; "model" mirrors the sidecar's
+    # field name so either identity is readable from the dataframe alone.
+    df.attrs["embedding_model"] = EMBED_MODEL
+    df.attrs["model"] = EMBED_MODEL
     tmp_df = "embeddings.joblib.partial"
     tmp_matrix = "embedding_matrix.npy.partial"
     tmp_meta = "embedding_matrix.meta.json.partial"
