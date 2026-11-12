@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@v7
@@ -26,12 +26,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      # The tests exercise chunking, caching, batch ordering and device
-      # selection by reading the source directly, so faster-whisper — the
-      # one heavy dependency left — is not installed here.
+      # The full runtime dependency set is installed here, so a dependency
+      # that no longer resolves fails CI instead of failing on a user's
+      # machine months later.
       - name: Install test dependencies
-        run: pip install pytest joblib numpy pandas requests ruff
+        run: pip install -r requirements-dev.txt
 
       # The scripts are mostly exercised end to end against Ollama and
       # ffmpeg, which CI does not have, so pyflakes is the net for names that

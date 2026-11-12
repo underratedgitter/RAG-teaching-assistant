@@ -6,7 +6,9 @@
 # download to transcribe a lecture. It replaces openai-whisper, which also no
 # longer builds on current Pythons (llvmlite has no wheel).
 faster-whisper>=1.2.1,<2
+# faster-whisper 1.2.1 calls av.open(metadata_errors=...), which PyAV 19
+# removed: without this cap every transcription fails with a TypeError.
+av>=11,<19
 requests>=2.34.2,<3
-numpy>=2.5.4,<3
+numpy>=2.4.6,<3
 pandas>=3.1.1,<4
-joblib>=1.6.0,<2
