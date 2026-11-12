@@ -90,13 +90,12 @@ def test_cleanup_is_safe_when_file_is_absent(tmp_path):
 
 def test_zero_byte_audio_is_not_treated_as_converted(tmp_path, monkeypatch):
     """An interrupted encode can leave an empty file; the size check catches it."""
-    monkeypatch.chdir(tmp_path)
-    audios = tmp_path / "audios"
-    audios.mkdir()
-    empty = audios / "1_lecture.mp3"
-    empty.write_bytes(b"")
-    assert empty.exists()
-    assert os.path.getsize(empty) == 0   # the guard video_to_mp3 now applies
+    h = _video_helpers(tmp_path, monkeypatch)
+    video = tmp_path / "videos" / "lecture.mp4"
+    audio = tmp_path / "audios" / "1_lecture.mp3"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"")
+    assert h["_audio_is_current"](str(audio), str(video)) is False
 
 
 # ── video_to_mp3: a replaced video must invalidate its audio/transcript ─────
@@ -310,19 +309,35 @@ def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
 
     df = pd.DataFrame.from_records(
         [
-            {"text": "one", "embedding": np.array([1.0, 0.0], dtype=np.float32)},
-            {"text": "two", "embedding": np.array([0.0, 1.0], dtype=np.float32)},
+            {
+                "number": "1", "title": "Lecture",
+                "start": np.int64(0), "end": np.float64(1.5),
+                "text": "one", "chunk_id": np.int64(0),
+                "embedding": np.array([1.0, 0.0], dtype=np.float32),
+            },
+            {
+                "number": "1", "title": "Lecture",
+                "start": np.int64(2), "end": np.float64(3.5),
+                "text": "two", "chunk_id": np.int64(1),
+                "embedding": np.array([0.0, 1.0], dtype=np.float32),
+            },
         ]
     )
     corpus_id = ns["cache_key"](["one", "two"])
     ns["save_artifacts"](df, corpus_id)
 
-    import joblib
+    payload = json.loads(Path("chunks.json").read_text(encoding="utf-8"))
+    assert payload["corpus_id"] == corpus_id
+    assert payload["model"] == "nomic-embed-text"
+    assert payload["document_prefix"] == "search_document: "
+    assert [c["text"] for c in payload["chunks"]] == ["one", "two"]
+    assert all("embedding" not in c for c in payload["chunks"])
+    assert isinstance(payload["chunks"][0]["start"], int)
+    assert isinstance(payload["chunks"][0]["end"], float)
 
-    loaded = joblib.load("embeddings.joblib")
-    assert loaded.attrs["corpus_id"] == corpus_id
-    assert loaded.attrs["embedding_model"] == "nomic-embed-text"
-    assert loaded.attrs["model"] == "nomic-embed-text"
+    # The pickled dataframe is gone: nothing on disk is unpickled any more.
+    assert not Path("embeddings.joblib").exists()
+
     assert np.load("embedding_matrix.npy").shape == (2, 2)
     assert json.loads(Path("embedding_matrix.meta.json").read_text()) == {
         "corpus_id": corpus_id,
@@ -423,10 +438,27 @@ def test_whisper_device_can_be_forced(monkeypatch):
     assert _pick_device(cuda_devices=1)() == "cpu"
 
 
-def test_model_load_failure_is_reported_not_raised():
+def test_model_load_failure_is_reported_not_raised(monkeypatch):
     """Previously a failure on 'tiny' propagated as an unhandled traceback."""
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
     src = (ROOT / "mp3_to_json.py").read_text()
-    assert "SystemExit" in src or "raise SystemExit" in src
+    start = src.index("def pick_device")
+    end = src.index("def split_audio_name")
+
+    class AlwaysFailingWhisperModel:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("Model initialization failed")
+
+    ns = {
+        "os": os,
+        "json": json,
+        "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 0)}),
+        "WhisperModel": AlwaysFailingWhisperModel,
+    }
+    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    with pytest.raises(SystemExit) as exc_info:
+        ns["load_model"]()
+    assert "Could not load any Whisper model" in str(exc_info.value)
 
 
 # ── mp3_to_json: the faster-whisper path ───────────────────────────────────

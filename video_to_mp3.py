@@ -9,6 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 os.makedirs("audios", exist_ok=True)
+os.makedirs("videos", exist_ok=True)
+
+# Pipeline exit code when some inputs fail but others succeed.
+PARTIAL_FAILURE = 2
 
 VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mkv', '.mov')
 
@@ -121,8 +125,7 @@ def _existing_audio_index(existing_audios):
         used_numbers.add(number)
 
         try:
-            if os.path.getsize(os.path.join("audios", audio_name)) <= 0:
-                continue
+            os.stat(os.path.join("audios", audio_name))
         except OSError:
             continue
 
@@ -217,7 +220,7 @@ def _quarantine_ambiguous_audio(files, existing_audios):
 
 existing_audios = set(os.listdir("audios"))
 
-files = [f for f in os.listdir("videos") if f.endswith(VIDEO_EXTENSIONS)]
+files = [f for f in os.listdir("videos") if f.lower().endswith(VIDEO_EXTENSIONS)]
 print(f"Found {len(files)} video files")
 
 
@@ -304,6 +307,7 @@ if failures:
     print(f"\n[WARNING] {len(failures)} file(s) failed to convert:")
     for message in failures:
         print(f"    {message}")
-    sys.exit(1)
+    # Exit 1 when no video produced audio, so the run stops at this stage.
+    sys.exit(PARTIAL_FAILURE if len(failures) < len(jobs) else 1)
 
 _quarantine_ambiguous_audio(files, existing_audios)

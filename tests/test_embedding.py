@@ -5,6 +5,7 @@ position, so a reordered result silently attaches every answer to the wrong
 timestamp.
 """
 import os
+import re
 import types
 from pathlib import Path
 
@@ -21,6 +22,16 @@ def load_module(monkeypatch, model="nomic-embed-text"):
     monkeypatch.setenv("EMBED_MODEL", model)
     exec(compile(head, "preprocess_json.py", "exec"), ns)
     return ns
+
+
+def function_source(name):
+    """The source of one top-level function, for asserting on its text."""
+    src = (ROOT / "preprocess_json.py").read_text()
+    start = src.index(f"def {name}")
+    rest = src[start:]
+    end = re.search(r"\n(?=[^\s#])", rest[len(f"def {name}"):])
+    body = rest if end is None else rest[: len(f"def {name}") + end.start()]
+    return body
 
 
 # ── cache key identity ──────────────────────────────────────────────────────
@@ -63,7 +74,18 @@ def test_cache_round_trip(tmp_path, monkeypatch):
 
     assert m["load_cached"]("f.json", texts) is None      # cold
     m["save_cached"]("f.json", texts, vecs)
-    assert m["load_cached"]("f.json", texts) == vecs      # warm
+    got = m["load_cached"]("f.json", texts)
+    assert got is not None
+    # The cache stores float32, so the vectors come back rounded.
+    import numpy as np
+    assert np.allclose(np.array(got), np.array(vecs, dtype=np.float32), atol=1e-6)
+
+
+def test_cache_is_stored_as_npz(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    m = load_module(monkeypatch)
+    m["save_cached"]("f.json", ["one"], [[0.1]])
+    assert Path(m["CACHE_DIR"], "f.json.npz").exists()
 
 
 def test_cache_misses_when_text_changes(tmp_path, monkeypatch):
@@ -77,7 +99,7 @@ def test_corrupt_cache_is_a_miss_not_a_crash(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     m = load_module(monkeypatch)
     os.makedirs(m["CACHE_DIR"], exist_ok=True)
-    Path(m["CACHE_DIR"], "f.json.joblib").write_bytes(b"not a joblib file")
+    Path(m["CACHE_DIR"], "f.json.npz").write_bytes(b"not an npz file")
     assert m["load_cached"]("f.json", ["one"]) is None
 
 
@@ -87,6 +109,45 @@ def test_cache_write_is_atomic(tmp_path, monkeypatch):
     m["save_cached"]("f.json", ["one"], [[0.1]])
     leftovers = [p for p in Path(m["CACHE_DIR"]).iterdir() if p.name.endswith(".partial")]
     assert not leftovers, "a .partial file was left behind"
+
+
+def test_empty_texts_do_not_crash_the_cache(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    m = load_module(monkeypatch)
+    m["save_cached"]("f.json", [], [])
+    assert m["load_cached"]("f.json", []) == []
+
+
+# ── the cache is never unpickled ────────────────────────────────────────────
+
+def test_cache_is_read_without_pickle():
+    """A cached file must not be able to execute code when it is read."""
+    assert "allow_pickle=False" in function_source("load_cached")
+
+
+def test_no_joblib_left_in_the_pipeline():
+    """joblib.load unpickles, so a tampered artifact would run code."""
+    src = (ROOT / "preprocess_json.py").read_text()
+    assert "joblib" not in src
+
+
+# ── task prefixes ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("model", ["nomic-embed-text", "nomic-embed-text:v1.5"])
+def test_nomic_models_get_the_document_prefix(monkeypatch, model):
+    m = load_module(monkeypatch, model=model)
+    assert m["DOCUMENT_PREFIX"] == "search_document: "
+
+
+def test_other_models_take_raw_text(monkeypatch):
+    m = load_module(monkeypatch, model="mxbai-embed-large")
+    assert m["DOCUMENT_PREFIX"] == ""
+
+
+def test_the_prefix_changes_the_cache_key(monkeypatch):
+    """Vectors embedded without the prefix must never be reused."""
+    m = load_module(monkeypatch)
+    assert m["cache_key"](["search_document: a"]) != m["cache_key"](["a"])
 
 
 # ── parallel batching must preserve order ───────────────────────────────────
@@ -156,3 +217,31 @@ def test_a_failing_batch_propagates(monkeypatch):
     m["_embed_batch"] = boom
     with pytest.raises(RuntimeError):
         m["create_embedding"]([f"{c}0" for c in "abcde"], batch_size=1)
+
+
+def test_failed_batch_with_failing_single_text_raises(monkeypatch):
+    """When a batch fails and a text still fails alone, _embed_batch raises rather than shortening."""
+    m = load_module(monkeypatch)
+    requests = m["requests"]
+
+    class FakeResponse:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def raise_for_status(self):
+            if len(self.texts) > 1:
+                raise requests.exceptions.HTTPError("batch too large")
+            if "bad" in self.texts:
+                raise requests.exceptions.HTTPError("invalid chunk")
+
+        def json(self):
+            return {"embeddings": [[float(len(t))] for t in self.texts]}
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            return FakeResponse(json["input"])
+
+    m["session"] = FakeSession()
+    with pytest.raises(requests.exceptions.HTTPError):
+        m["_embed_batch"](["a", "bad", "ccc"])
+
