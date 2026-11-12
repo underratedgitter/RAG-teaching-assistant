@@ -1,12 +1,17 @@
 import json
 import os
+import sys
 import time
 
 import ctranslate2
 from faster_whisper import WhisperModel
 
 # Setup for performance and reliability
+os.makedirs("audios", exist_ok=True)
 os.makedirs("jsons", exist_ok=True)
+
+# Pipeline exit code when some inputs fail but others succeed.
+PARTIAL_FAILURE = 2
 
 
 def pick_device():
@@ -57,27 +62,44 @@ else:
 _cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 
 model = None
-for _name in _model_ladder:
-    for _ct in _compute_ladder:
-        try:
-            model = WhisperModel(
-                _name,
-                device=device,
-                compute_type=_ct,
-                cpu_threads=_cpu_threads if device == "cpu" else 0,
-            )
-            print(f"Loaded '{_name}' model ({_ct})")
-            break
-        except Exception as e:
-            print(f"[WARNING] Failed to load '{_name}' model as {_ct}: {e}")
-    if model is not None:
-        break
 
-if model is None:
-    # Previously a failure on 'tiny' propagated as an unhandled exception.
+
+def load_model():
+    """Load the Whisper model, falling back across precision and hardware."""
+    for _name in _model_ladder:
+        for _ct in _compute_ladder:
+            try:
+                loaded = WhisperModel(
+                    _name,
+                    device=device,
+                    compute_type=_ct,
+                    cpu_threads=_cpu_threads if device == "cpu" else 0,
+                )
+                print(f"Loaded '{_name}' model ({_ct})")
+                return loaded
+            except Exception as e:
+                print(f"[WARNING] Failed to load '{_name}' model as {_ct}: {e}")
+
+    if device == "cuda":
+        print("[WARNING] CUDA model loading failed — falling back to CPU")
+        for _name in _model_ladder:
+            for _ct in ("int8", "float32"):
+                try:
+                    loaded = WhisperModel(
+                        _name,
+                        device="cpu",
+                        compute_type=_ct,
+                        cpu_threads=_cpu_threads,
+                    )
+                    print(f"Loaded '{_name}' model ({_ct})")
+                    return loaded
+                except Exception as e:
+                    print(f"[WARNING] Failed to load '{_name}' model as {_ct}: {e}")
+
     raise SystemExit(
         "Could not load any Whisper model. Check the install and free disk space."
     )
+
 
 # Greedy decoding. Beam search explores five candidate transcripts per window
 # and picks the best; on lecture speech it changes almost nothing and costs
@@ -90,7 +112,22 @@ _beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
 # model never has to decode. Set WHISPER_VAD=0 to disable.
 _use_vad = os.environ.get("WHISPER_VAD", "1") != "0"
 
-audios = [f for f in os.listdir("audios") if f.endswith('.mp3')]
+
+def split_audio_name(audio):
+    """Extract (number, title) from an audio filename."""
+    name = os.path.splitext(os.path.basename(audio))[0]
+    if "_" in name:
+        parts = name.split("_", 1)
+        number = parts[0]
+        title = parts[1] if len(parts) > 1 else name
+        for ext in ('.mp4', '.avi', '.mkv', '.mov'):
+            if title.lower().endswith(ext):
+                title = title[:-len(ext)]
+                break
+    else:
+        number = "1"
+        title = name
+    return number, title
 
 
 def already_transcribed(json_filename):
@@ -106,8 +143,10 @@ def already_transcribed(json_filename):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("transcript root must be an object")
         return bool(data.get("chunks"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (ValueError, OSError):   # ValueError covers JSON and Unicode decode errors
         print(f"  [!] {json_filename} is corrupt — re-transcribing")
         try:
             os.remove(path)
@@ -162,7 +201,14 @@ def transcribe_with_fallback(path, use_vad=None):
         return transcribe(path, False)
 
 
+audios = sorted([f for f in os.listdir("audios") if f.endswith('.mp3')])
 print(f"Found {len(audios)} audio files", flush=True)
+
+# Loading the model costs seconds and gigabytes, so skip it when every file
+# is already transcribed.
+pending = {a for a in audios if not already_transcribed(f"{a}.json")}
+if pending:
+    model = load_model()
 
 start_total = time.time()
 results = {"success": 0, "skipped": 0, "failed": 0}
@@ -170,20 +216,12 @@ audio_seconds = 0.0
 
 for idx, audio in enumerate(audios, 1):
     json_filename = f"{audio}.json"
-    if already_transcribed(json_filename):
+    if audio not in pending:
         print(f"[{idx}/{len(audios)}] Skipping {audio} (exists)", flush=True)
         results["skipped"] += 1
         continue
 
-    # Extract number and title from filename: "1_VideoName.mp3"
-    name = os.path.splitext(audio)[0]  # Remove .mp3
-    if "_" in name:
-        parts = name.split("_", 1)
-        number = parts[0]
-        title = parts[1] if len(parts) > 1 else name
-    else:
-        number = "1"
-        title = name
+    number, title = split_audio_name(audio)
 
     print(f"[{idx}/{len(audios)}] Transcribing: {audio}", flush=True)
     start = time.time()
@@ -264,6 +302,12 @@ elapsed_total = time.time() - start_total
 overall = f" — {audio_seconds / elapsed_total:.0f}x realtime" if elapsed_total > 0 and audio_seconds else ""
 print(f"\nDone! ({elapsed_total:.1f}s total{overall})")
 print(f"  Success: {results['success']}, Skipped: {results['skipped']}, Failed: {results['failed']}")
+
+if results["failed"] > 0:
+    # Exit 1 when nothing at all is usable, so the dashboard stops here and
+    # names this stage instead of failing later in embedding.
+    usable = results["success"] + results["skipped"]
+    sys.exit(PARTIAL_FAILURE if usable else 1)
 
 if results["success"] > 0 or results["skipped"] > 0:
     print("[STATUS] Ready for next step")

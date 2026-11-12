@@ -1,11 +1,12 @@
 import requests
 import os
+import sys
 import json
 import hashlib
 import numpy as np
 import pandas as pd
-import joblib
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -16,7 +17,15 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # plenty — this is about not leaving the GPU idle between requests.
 EMBED_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "3"))
 
+# Exit code when some inputs failed but the rest were processed.
+PARTIAL_FAILURE = 2
+
 CACHE_DIR = ".embed_cache"
+
+# nomic-embed-text is trained with task prefixes: a document has to be
+# embedded as "search_document: <text>" (and a query as "search_query: <text>")
+# or the vectors are ranked badly. Other embedding models take the raw text.
+DOCUMENT_PREFIX = "search_document: " if EMBED_MODEL.startswith("nomic-embed-text") else ""
 
 
 def cache_key(texts):
@@ -31,24 +40,36 @@ def cache_key(texts):
 
 def load_cached(json_file, texts):
     """Embeddings from a previous run, if this file's text is unchanged."""
-    path = os.path.join(CACHE_DIR, f"{json_file}.joblib")
+    path = os.path.join(CACHE_DIR, f"{json_file}.npz")
     if not os.path.exists(path):
         return None
     try:
-        blob = joblib.load(path)
-        if blob.get("key") == cache_key(texts) and len(blob.get("embeddings", [])) == len(texts):
-            return blob["embeddings"]
-    except Exception:
+        # allow_pickle=False: a cached file must never be able to run code.
+        with np.load(path, allow_pickle=False) as blob:
+            key = blob["key"].item()
+            embeddings = blob["embeddings"]
+            rows = embeddings.shape[0] if embeddings.ndim else 0
+            if key == cache_key(texts) and rows == len(texts):
+                return embeddings.tolist()
+    except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
         pass
     return None
 
 
 def save_cached(json_file, texts, embeddings):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{json_file}.joblib")
+    path = os.path.join(CACHE_DIR, f"{json_file}.npz")
     tmp = path + ".partial"
     try:
-        joblib.dump({"key": cache_key(texts), "embeddings": embeddings}, tmp)
+        array = np.asarray(embeddings, dtype=np.float32)
+        if array.ndim == 1:
+            array = array.reshape(len(texts), -1) if array.size else np.zeros((0, 0), dtype=np.float32)
+        # The file object is passed to np.savez on purpose: given a filename,
+        # numpy would append ".npz" to the temp path.
+        with open(tmp, "wb") as handle:
+            np.savez(handle, key=np.array(cache_key(texts)), embeddings=array)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     except Exception as e:
         print(f"   [WARNING] Could not cache embeddings for {json_file}: {e}")
@@ -59,28 +80,30 @@ def save_cached(json_file, texts, embeddings):
             pass
 
 
-def save_artifacts(df, corpus_id):
-    """Write the dataframe and matrix as one validated pair.
+def _plain(value):
+    """numpy scalars are not JSON types; unwrap them before dumping."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
-    The dataframe carries the corpus id and embedding model in ``df.attrs``;
-    the matrix sidecar records the same identity. The dashboard refuses
+
+def save_artifacts(df, corpus_id):
+    """Write the chunk records and the embedding matrix as one validated pair.
+
+    ``chunks.json`` carries the corpus id, the embedding model and the task
+    prefix; the matrix sidecar records the same identity. The dashboard refuses
     artifacts whose corpus or model does not match, so a crash between writes
     cannot leave row numbers pointing at the wrong chunks, and changing
     EMBED_MODEL cannot silently reuse vectors from the previous model.
+
+    Nothing is pickled: reading a tampered artifact would otherwise execute
+    code.
     """
-    df.attrs["corpus_id"] = corpus_id
-    # "embedding_model" is the canonical attr; "model" mirrors the sidecar's
-    # field name so either identity is readable from the dataframe alone.
-    df.attrs["embedding_model"] = EMBED_MODEL
-    df.attrs["model"] = EMBED_MODEL
-    tmp_df = "embeddings.joblib.partial"
+    tmp_chunks = "chunks.json.partial"
     tmp_matrix = "embedding_matrix.npy.partial"
     tmp_meta = "embedding_matrix.meta.json.partial"
 
     try:
-        joblib.dump(df, tmp_df, compress=3)
-        os.replace(tmp_df, "embeddings.joblib")
-
         matrix = np.vstack(df["embedding"].values).astype(np.float32)
         with open(tmp_matrix, "wb") as handle:
             np.save(handle, matrix)
@@ -94,8 +117,28 @@ def save_artifacts(df, corpus_id):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_meta, "embedding_matrix.meta.json")
+
+        columns = [c for c in df.columns if c != "embedding"]
+        chunks = [
+            {name: _plain(value) for name, value in row.items()}
+            for row in df[columns].to_dict(orient="records")
+        ]
+        payload = {
+            "corpus_id": corpus_id,
+            "model": EMBED_MODEL,
+            "document_prefix": DOCUMENT_PREFIX,
+            "chunks": chunks,
+        }
+        # Written last: the chunk records are what the dashboard reads to
+        # decide the artifacts are current, so they must not exist before the
+        # matrix they describe.
+        with open(tmp_chunks, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_chunks, "chunks.json")
     finally:
-        for path in (tmp_df, tmp_matrix, tmp_meta):
+        for path in (tmp_chunks, tmp_matrix, tmp_meta):
             try:
                 if os.path.exists(path):
                     os.remove(path)
@@ -133,7 +176,9 @@ def _embed_batch(batch):
         print(f"   [WARNING] Embedding request failed: {e}")
         if len(batch) == 1:
             raise
-        # One bad chunk shouldn't cost the whole batch.
+        # Retrying one at a time isolates a transient or size-related batch
+        # failure. A text that still fails alone raises, so the file is
+        # reported as failed rather than saved with misaligned embeddings.
         out = []
         for text in batch:
             r = session.post(f"{OLLAMA_URL}/api/embed",
@@ -201,13 +246,17 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
     for seg in chunks:
         if buf_words >= target_words:
             flush()
-            # carry the tail forward as overlap, timestamps included
+            # Carry the tail forward as overlap, timestamps included. The
+            # overlap must stay below the target: a carried segment that
+            # already fills a chunk would trigger a flush on every following
+            # segment and repeat itself in each of those chunks.
             tail, running = [], 0
             for s in reversed(buf):
-                running += len(s["text"].split())
-                tail.insert(0, s)
-                if running >= overlap_words:
+                words = len(s["text"].split())
+                if running >= overlap_words or running + words >= target_words:
                     break
+                running += words
+                tail.insert(0, s)
             buf, buf_words = tail, running
         buf.append(seg)
         buf_words += len(seg["text"].split())
@@ -223,6 +272,7 @@ print("="*50)
 
 start_time = time.time()
 
+os.makedirs("jsons", exist_ok=True)
 # Sorted so chunk_ids are stable from run to run; listdir order is arbitrary.
 jsons = sorted(f for f in os.listdir("jsons") if f.endswith('.json'))
 print(f"\n[*] Found {len(jsons)} JSON files")
@@ -235,7 +285,7 @@ cached_files = 0
 
 for json_idx, json_file in enumerate(jsons, 1):
     try:
-        with open(f"jsons/{json_file}") as f:
+        with open(f"jsons/{json_file}", encoding="utf-8") as f:
             content = json.load(f)
 
         raw_chunks = content['chunks']
@@ -247,8 +297,10 @@ for json_idx, json_file in enumerate(jsons, 1):
         # Embedding is the expensive stage, and adding one lecture used to
         # re-embed the entire library. Cached by a hash of this file's chunk
         # text plus the model name, so unchanged files cost nothing and a
-        # changed transcript or a different model invalidates itself.
-        texts = [c['text'] for c in merged_chunks]
+        # changed transcript or a different model invalidates itself. The
+        # hash covers the prefixed text, so switching the task prefix cannot
+        # reuse vectors that were embedded without it.
+        texts = [DOCUMENT_PREFIX + c['text'] for c in merged_chunks]
         embeddings = load_cached(json_file, texts)
         if embeddings is None:
             embeddings = create_embedding(texts, batch_size=128)
@@ -281,15 +333,16 @@ if not my_dicts:
         print("    every file failed:")
         for name, err in failed:
             print(f"      {name}: {err}")
-    exit(1)
+    sys.exit(1)
 
 print(f"\n[>] Creating DataFrame with {len(my_dicts)} total chunks...")
 df = pd.DataFrame.from_records(my_dicts)
 
-# Tie the dataframe and the matrix together. The id covers every chunk text
-# and the embedding model, so a matrix from another run cannot be mistaken for
-# this one even when both happen to have the same number of rows.
-corpus_id = cache_key([chunk["text"] for chunk in my_dicts])
+# Tie the chunk records and the matrix together. The id covers every chunk
+# text (with its task prefix) and the embedding model, so a matrix from
+# another run cannot be mistaken for this one even when both happen to have
+# the same number of rows.
+corpus_id = cache_key([DOCUMENT_PREFIX + chunk["text"] for chunk in my_dicts])
 
 print("[*] Saving embeddings...")
 save_artifacts(df, corpus_id)
@@ -310,4 +363,7 @@ if failed:
     print("   Everything else was embedded and saved.")
 
 session.close()
+
+if failed:
+    sys.exit(PARTIAL_FAILURE)
 

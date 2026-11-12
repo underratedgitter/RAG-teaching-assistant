@@ -107,3 +107,41 @@ def test_scales_linearly_not_quadratically():
     small, large = timed(500), timed(4000)
     # 8x the input should be well under 30x the time if it is linear
     assert large < small * 30, f"{small:.4f}s -> {large:.4f}s looks superlinear"
+
+
+def test_oversized_segment_is_not_repeated():
+    segs = []
+    for i in range(3):
+        text = " ".join(f"pre_{i}_{w}" for w in range(8))
+        segs.append(seg(text, float(i), float(i + 1)))
+
+    big_text = " ".join(f"big_{w}" for w in range(160))
+    segs.append(seg(big_text, 3.0, 23.0))
+
+    for i in range(10):
+        text = " ".join(f"post_{i}_{w}" for w in range(8))
+        segs.append(seg(text, 23.0 + i, 24.0 + i))
+
+    merged = merge_segments(segs, target_words=150, overlap_words=30)
+
+    # (a) Oversized segment appears in at most 2 chunks; every segment in at least one chunk
+    big_count = sum(1 for c in merged if big_text in c["text"])
+    assert big_count <= 2
+    for s in segs:
+        assert any(s["text"] in c["text"] for c in merged)
+
+    # (c) No merged chunk is empty and chunk start times are non-decreasing
+    assert all(len(c["text"].strip()) > 0 for c in merged)
+    start_times = [c["start"] for c in merged]
+    assert all(t1 <= t2 for t1, t2 in zip(start_times, start_times[1:]))
+
+
+def test_overlap_zero_produces_no_overlap():
+    # (b) overlap_words=0 produces no overlap: with existing build() helper,
+    # each original segment text appears in exactly one merged chunk.
+    segs = build()
+    merged = merge_segments(segs, target_words=150, overlap_words=0)
+    for s in segs:
+        count = sum(1 for c in merged if s["text"] in c["text"])
+        assert count == 1
+

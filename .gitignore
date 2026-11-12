@@ -9,6 +9,8 @@ __pycache__/
 # Data files (large, user-specific)
 embeddings.joblib
 embedding_matrix.npy
+chunks.json
+embedding_matrix.meta.json
 
 # Media folders (user content)
 videos/
