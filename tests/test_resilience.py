@@ -4,6 +4,7 @@ These cover failures that only appear after an interruption — a Ctrl+C, a
 timeout, a machine going to sleep mid-encode — and which the skip-already-done
 logic would otherwise make permanent.
 """
+import ast
 import json
 import os
 import re
@@ -464,12 +465,19 @@ def test_model_load_failure_is_reported_not_raised(monkeypatch):
 # ── mp3_to_json: the faster-whisper path ───────────────────────────────────
 
 def _transcription_helpers(model, beam_size=1, use_vad=True):
-    """Load transcribe()/transcribe_with_fallback() against a stub model."""
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def transcribe(")
-    end = src.index('print(f"Found {len(audios)}')
+    """Load transcribe()/transcribe_with_fallback() against a stub model.
+
+    Only the two functions are compiled. Slicing the file out by hand also ran
+    the module-level statements that follow them, and the first of those
+    reads the audios/ directory — which a fresh checkout does not have.
+    """
+    path = ROOT / "mp3_to_json.py"
+    tree = ast.parse(path.read_text())
+    body = [node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"transcribe", "transcribe_with_fallback"}]
     ns = {"os": os, "model": model, "_beam_size": beam_size, "_use_vad": use_vad}
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), ns)
     return ns
 
 
@@ -523,6 +531,60 @@ def test_segments_are_drained_not_returned_lazily():
     ns = _transcription_helpers(_StubModel())
     segments, _ = ns["transcribe"]("audios/x.mp3", False)
     assert isinstance(segments, list) and len(segments) == 2
+
+
+def test_the_helpers_load_without_the_media_directories(tmp_path, monkeypatch):
+    """A fresh checkout has no audios/ — loading the helpers must not need it.
+
+    The regression: the helpers used to be cut out of mp3_to_json.py by
+    slicing its source, and the slice also ran the pipeline statement that
+    lists the audios/ directory. Locally that directory exists, so the tests
+    passed; in CI it does not, and all three failed.
+    """
+    monkeypatch.chdir(tmp_path)
+    ns = _transcription_helpers(_StubModel())
+    assert callable(ns["transcribe"])
+    assert callable(ns["transcribe_with_fallback"])
+
+
+def test_the_helpers_run_no_pipeline_code(tmp_path, monkeypatch):
+    """Only the two functions may be compiled.
+
+    Anything else the slice picks up runs for real — a directory read, a
+    model load — and makes the test depend on the machine it runs on.
+    """
+    monkeypatch.chdir(tmp_path)
+    ns = _transcription_helpers(_StubModel())
+    loaded = set(ns) - {"__builtins__", "os", "model", "_beam_size", "_use_vad"}
+    assert loaded == {"transcribe", "transcribe_with_fallback"}
+
+
+@pytest.mark.parametrize(
+    "script", ["mp3_to_json.py", "video_to_mp3.py", "preprocess_json.py", "dashboard.py"]
+)
+def test_a_module_level_directory_read_follows_its_creation(script):
+    """A fresh clone has no audios/, jsons/ or videos/.
+
+    Module-level code has to create a directory before it lists one, or the
+    script dies on a clean checkout.
+    """
+    tree = ast.parse((ROOT / script).read_text())
+    created = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue          # a function body, not module-level code
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)):
+                continue
+            first = call.args[0] if call.args else None
+            if call.func.attr == "makedirs":
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    created.add(first.value)
+            elif call.func.attr == "listdir":
+                assert isinstance(first, ast.Constant) and first.value in created, (
+                    f"{script} lists {first.value!r} at module level before creating it"
+                )
 
 
 def test_greedy_decoding_is_the_default():
