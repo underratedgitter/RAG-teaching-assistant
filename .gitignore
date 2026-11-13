@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
 # Data files (large, user-specific)
 embeddings.joblib
 embedding_matrix.npy
