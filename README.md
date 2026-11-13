@@ -13,7 +13,7 @@ Transcription is the slow stage, so it runs on [faster-whisper](https://github.c
 Four stages, each a script you can run on its own.
 
 ```
-videos/  ──video_to_mp3──>  audios/  ──mp3_to_json──>  jsons/  ──preprocess_json──>  chunks.json + embedding_matrix.npy (+ .meta.json)
+videos/  ──video_to_mp3──>  audios/  ──mp3_to_json──>  jsons/  ──preprocess_json──>  chunks.json + embedding_matrix.npy (+ embedding_matrix.meta.json)
                                                                                             │
                                                                                       dashboard.py
 ```
@@ -143,10 +143,11 @@ video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
 mp3_to_json.py        faster-whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
 dashboard.py          Tkinter UI, dot-product retrieval, prompt assembly
-tests/                pipeline, dashboard and crash-safety tests
+tests/                pipeline, dashboard, audio and crash-safety tests
+tests/_pipeline.py    shared loader compiling script definitions in isolation
 requirements.txt      runtime dependencies
 requirements-dev.txt  adds the pinned test and lint tools CI uses
-project_blueprint.txt design notes
+project_blueprint.txt older design notes (predates the pickle-free storage)
 ```
 
 ## Tests
@@ -155,7 +156,8 @@ project_blueprint.txt design notes
 pip install -r requirements-dev.txt && pytest tests/ -q
 ```
 
-Tests covering chunk sizing, timestamp correctness, overlap, content
+Tests covering audio conversion, transcription loop and device fallbacks, PyAV
+compatibility, chunk sizing, timestamp correctness, overlap, content
 preservation, linear scaling, embedding-cache invalidation, parallel batch
 ordering, the crash-safety of every file the pipeline writes, corpus and model
 identity on load, prompt construction, and the dashboard's threading. They need no models and no network.
