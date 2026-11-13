@@ -5,27 +5,26 @@ timeout, a machine going to sleep mid-encode — and which the skip-already-done
 logic would otherwise make permanent.
 """
 import ast
+import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
+
+from _pipeline import WHISPER_CONFIG, load
 
 ROOT = Path(__file__).parent.parent
 
 
 def _extract(path, name):
     """Pull one function out of a pipeline script without running the script."""
-    src = (ROOT / path).read_text()
-    start = src.index(f"def {name}")
-    rest = src[start:]
-    # up to the next top-level statement
-    end = re.search(r"\n(?=[^\s#])", rest[len(f"def {name}"):])
-    body = rest if end is None else rest[: len(f"def {name}") + end.start()]
-    ns = {"os": os, "json": json}
-    exec(compile(body, path, "exec"), ns)
-    return ns[name]
+    return load(path, functions=[name], namespace={"os": os, "json": json})[name]
 
 
 # ── mp3_to_json: a corrupt transcript must not be skipped forever ───────────
@@ -106,11 +105,15 @@ def _video_helpers(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "audios").mkdir(exist_ok=True)
     (tmp_path / "videos").mkdir(exist_ok=True)
-    src = (ROOT / "video_to_mp3.py").read_text()
-    head = src[: src.index("existing_audios =")]
-    ns = {"__name__": "video_to_mp3_helpers"}
-    exec(compile(head, "video_to_mp3.py", "exec"), ns)
-    return ns
+    return load(
+        "video_to_mp3.py",
+        functions="all",
+        constants={"PARTIAL_FAILURE", "VIDEO_EXTENSIONS"},
+        namespace={
+            "os": os, "json": json, "re": re, "tempfile": tempfile,
+            "subprocess": subprocess, "sys": sys, "time": time,
+        },
+    )
 
 
 def test_audio_without_sidecar_uses_mtime_fallback(tmp_path, monkeypatch):
@@ -302,11 +305,13 @@ def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
     import numpy as np
     import pandas as pd
 
-    src = (ROOT / "preprocess_json.py").read_text()
-    head = src[: src.index('print("="*50)')]
-    ns = {"__name__": "pp"}
     monkeypatch.setenv("EMBED_MODEL", "nomic-embed-text")
-    exec(compile(head, "preprocess_json.py", "exec"), ns)
+    ns = load(
+        "preprocess_json.py",
+        functions=["cache_key", "save_artifacts", "_plain"],
+        constants={"EMBED_MODEL", "DOCUMENT_PREFIX", "CACHE_DIR"},
+        namespace={"os": os, "json": json, "hashlib": hashlib, "np": np, "pd": pd},
+    )
 
     df = pd.DataFrame.from_records(
         [
@@ -348,11 +353,7 @@ def test_artifacts_record_a_matching_corpus_id(tmp_path, monkeypatch):
 
 
 def test_matrix_from_another_corpus_is_rejected():
-    src = (ROOT / "dashboard.py").read_text()
-    start = src.index("def _matrix_matches_dataframe")
-    end = src.index("if _has_gpu_offload()")
-    ns = {}
-    exec(compile(src[start:end], "dashboard.py", "exec"), ns)
+    ns = load("dashboard.py", functions=["_matrix_matches_dataframe"])
 
     class Frame:
         attrs = {"corpus_id": "new"}
@@ -414,12 +415,11 @@ def test_gpu_offload_is_not_assumed_on_intel_mac():
 
 def _pick_device(cuda_devices=0):
     """Load pick_device() alone, with a stub CTranslate2 reporting N GPUs."""
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def pick_device")
-    end = src.index("device = pick_device()")
-    ns = {"os": os, "ctranslate2": type("ct", (), {
-        "get_cuda_device_count": staticmethod(lambda: cuda_devices)})}
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    ns = load("mp3_to_json.py", functions=["pick_device"], namespace={
+        "os": os,
+        "ctranslate2": type("ct", (), {
+            "get_cuda_device_count": staticmethod(lambda: cuda_devices)}),
+    })
     return ns["pick_device"]
 
 
@@ -442,21 +442,23 @@ def test_whisper_device_can_be_forced(monkeypatch):
 def test_model_load_failure_is_reported_not_raised(monkeypatch):
     """Previously a failure on 'tiny' propagated as an unhandled traceback."""
     monkeypatch.delenv("WHISPER_DEVICE", raising=False)
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def pick_device")
-    end = src.index("def split_audio_name")
 
     class AlwaysFailingWhisperModel:
         def __init__(self, *args, **kwargs):
             raise RuntimeError("Model initialization failed")
 
-    ns = {
-        "os": os,
-        "json": json,
-        "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 0)}),
-        "WhisperModel": AlwaysFailingWhisperModel,
-    }
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    ns = load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "json": json,
+            "ctranslate2": type("ct", (), {
+                "get_cuda_device_count": staticmethod(lambda: 0)}),
+            "WhisperModel": AlwaysFailingWhisperModel,
+        },
+    )
     with pytest.raises(SystemExit) as exc_info:
         ns["load_model"]()
     assert "Could not load any Whisper model" in str(exc_info.value)
@@ -471,14 +473,12 @@ def _transcription_helpers(model, beam_size=1, use_vad=True):
     the module-level statements that follow them, and the first of those
     reads the audios/ directory — which a fresh checkout does not have.
     """
-    path = ROOT / "mp3_to_json.py"
-    tree = ast.parse(path.read_text())
-    body = [node for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"transcribe", "transcribe_with_fallback"}]
-    ns = {"os": os, "model": model, "_beam_size": beam_size, "_use_vad": use_vad}
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), ns)
-    return ns
+    return load(
+        "mp3_to_json.py",
+        functions=["transcribe", "transcribe_with_fallback"],
+        namespace={"os": os, "model": model,
+                   "_beam_size": beam_size, "_use_vad": use_vad},
+    )
 
 
 class _Seg:
@@ -503,6 +503,86 @@ class _StubModel:
         if self.fail_on_vad and kw.get("vad_filter"):
             raise RuntimeError("vad model missing")
         return iter([_Seg(0.0, 5.0, "hello"), _Seg(5.0, 10.0, "world")]), _Info()
+
+
+class _StubWhisperModel:
+    """Stands in for faster_whisper.WhisperModel, so the loop can run."""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.inner = _StubModel()
+        _StubWhisperModel.instances.append(self)
+
+    def transcribe(self, path, **kw):
+        return self.inner.transcribe(path, **kw)
+
+
+def _run_transcription(monkeypatch):
+    """Run mp3_to_json.py's own loop against a stubbed Whisper model.
+
+    Nothing else in the suite runs that loop, so a mistake in it — a wrong
+    path, a broken skip check — would reach a user before any test saw it.
+    """
+    import runpy
+    import types
+
+    fake_ctranslate2 = types.ModuleType("ctranslate2")
+    fake_ctranslate2.get_cuda_device_count = lambda: 0
+    fake_faster_whisper = types.ModuleType("faster_whisper")
+    fake_faster_whisper.WhisperModel = _StubWhisperModel
+    monkeypatch.setitem(sys.modules, "ctranslate2", fake_ctranslate2)
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_faster_whisper)
+    _StubWhisperModel.instances = []
+
+    try:
+        # run_name matters: with the default "<run_path>", a script that ever
+        # gains an `if __name__ == "__main__":` guard would quietly stop
+        # running its pipeline, and these tests would pass without testing.
+        runpy.run_path(str(ROOT / "mp3_to_json.py"), run_name="__main__")
+    except SystemExit as exit_error:
+        return exit_error.code
+    return 0
+
+
+def test_the_transcription_loop_writes_a_transcript(tmp_path, monkeypatch):
+    """The loop must find its audio, transcribe it and write the transcript."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "audios").mkdir()
+    (tmp_path / "jsons").mkdir()
+    (tmp_path / "audios" / "1_lecture.mp3").write_bytes(b"ID3" + b"\0" * 512)
+
+    code = _run_transcription(monkeypatch)
+
+    assert code == 0
+    transcript = tmp_path / "jsons" / "1_lecture.mp3.json"
+    assert transcript.exists(), "the loop finished without writing a transcript"
+    payload = json.loads(transcript.read_text(encoding="utf-8"))
+    assert [chunk["text"] for chunk in payload["chunks"]] == ["hello", "world"]
+    assert payload["chunks"][0]["title"] == "lecture"
+
+
+def test_the_transcription_loop_skips_a_finished_transcript(tmp_path, monkeypatch):
+    """A transcript that is already there must not be redone.
+
+    Re-transcribing every lecture costs the model load and the hours it
+    takes; the skip is what makes a second run cheap.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "audios").mkdir()
+    (tmp_path / "jsons").mkdir()
+    (tmp_path / "audios" / "1_lecture.mp3").write_bytes(b"ID3" + b"\0" * 512)
+    done = tmp_path / "jsons" / "1_lecture.mp3.json"
+    done.write_text(
+        json.dumps({"chunks": [{"text": "kept", "start": 0, "end": 1}]}),
+        encoding="utf-8",
+    )
+
+    code = _run_transcription(monkeypatch)
+
+    assert code == 0
+    assert json.loads(done.read_text(encoding="utf-8"))["chunks"][0]["text"] == "kept"
+    assert not _StubWhisperModel.instances, "the model was loaded for a file that was already done"
 
 
 def test_vad_failure_retries_without_vad():
@@ -582,7 +662,9 @@ def test_a_module_level_directory_read_follows_its_creation(script):
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     created.add(first.value)
             elif call.func.attr == "listdir":
-                assert isinstance(first, ast.Constant) and first.value in created, (
+                assert isinstance(first, ast.Constant), (
+                    f"{script} lists a directory it does not name literally")
+                assert first.value in created, (
                     f"{script} lists {first.value!r} at module level before creating it"
                 )
 

@@ -4,24 +4,45 @@ Order is the dangerous part here: retrieval maps embeddings to chunks by
 position, so a reordered result silently attaches every answer to the wrong
 timestamp.
 """
+import hashlib
+import json
 import os
 import re
-import types
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
+import requests
+
+from _pipeline import load
 
 ROOT = Path(__file__).parent.parent
 
 
 def load_module(monkeypatch, model="nomic-embed-text"):
     """Load preprocess_json's helpers without running its pipeline."""
-    src = (ROOT / "preprocess_json.py").read_text()
-    head = src[: src.index('print("="*50)')]
-    ns = types.ModuleType("pp").__dict__
     monkeypatch.setenv("EMBED_MODEL", model)
-    exec(compile(head, "preprocess_json.py", "exec"), ns)
-    return ns
+    return load(
+        "preprocess_json.py",
+        functions={
+            "cache_key", "load_cached", "save_cached", "_embed_batch",
+            "create_embedding",
+        },
+        constants={
+            "OLLAMA_URL", "EMBED_MODEL", "EMBED_CONCURRENCY", "PARTIAL_FAILURE",
+            "CACHE_DIR", "DOCUMENT_PREFIX",
+        },
+        namespace={
+            "os": os, "json": json, "hashlib": hashlib, "zipfile": zipfile,
+            "time": time, "np": np, "pd": pd, "requests": requests,
+            "session": requests.Session(),
+            "ThreadPoolExecutor": ThreadPoolExecutor, "as_completed": as_completed,
+        },
+    )
 
 
 def function_source(name):

@@ -2,7 +2,15 @@
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
+
+import pytest
+
+from _pipeline import WHISPER_CONFIG, load
 
 ROOT = Path(__file__).parent.parent
 
@@ -12,23 +20,20 @@ def _video_helpers(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "audios").mkdir(exist_ok=True)
     (tmp_path / "videos").mkdir(exist_ok=True)
-    src = (ROOT / "video_to_mp3.py").read_text()
-    head = src[: src.index("existing_audios =")]
-    ns = {"__name__": "video_to_mp3_helpers"}
-    exec(compile(head, "video_to_mp3.py", "exec"), ns)
-    return ns
+    return load(
+        "video_to_mp3.py",
+        functions="all",
+        constants={"PARTIAL_FAILURE", "VIDEO_EXTENSIONS"},
+        namespace={
+            "os": os, "json": json, "re": re, "tempfile": tempfile,
+            "subprocess": subprocess, "sys": sys, "time": time,
+        },
+    )
 
 
 def _extract(path, name):
     """Pull one function out of a pipeline script without running the script."""
-    src = (ROOT / path).read_text()
-    start = src.index(f"def {name}")
-    rest = src[start:]
-    end = re.search(r"\n(?=[^\s#])", rest[len(f"def {name}"):])
-    body = rest if end is None else rest[: len(f"def {name}") + end.start()]
-    ns = {"os": os, "json": json}
-    exec(compile(body, path, "exec"), ns)
-    return ns[name]
+    return load(path, functions=[name], namespace={"os": os, "json": json})[name]
 
 
 def test_zero_byte_audio_keeps_same_output_name(tmp_path, monkeypatch):
@@ -64,12 +69,43 @@ def test_split_audio_name():
     assert split("2_notes.mp3") == ("2", "notes")
 
 
+def test_the_pinned_av_still_takes_faster_whisper_arguments(tmp_path):
+    """The av<19 cap is load-bearing, and a comment alone does not hold it.
+
+    faster-whisper 1.2.1 opens audio with av.open(..., metadata_errors=...),
+    which PyAV 19 removed. If the cap were ever lifted, every transcription
+    would fail at runtime — so check that the installed pair still fits.
+    """
+    try:
+        import av
+        import faster_whisper
+    except ImportError as missing:
+        if os.environ.get("CI"):
+            pytest.fail(f"the av/faster-whisper pair is not installed: {missing}")
+        pytest.skip(f"the av/faster-whisper pair is not installed: {missing}")
+    import wave
+
+    audio = Path(faster_whisper.__file__).parent / "audio.py"
+    # What faster-whisper actually asks of av, so the check below is exactly
+    # the call it will make.
+    kwargs = {}
+    if "metadata_errors" in audio.read_text(encoding="utf-8"):
+        kwargs["metadata_errors"] = "ignore"
+
+    path = tmp_path / "silence.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0" * 3200)
+
+    with av.open(str(path), mode="r", **kwargs) as container:
+        assert container.duration is not None
+
+
 def test_cuda_exhausted_falls_back_to_cpu(monkeypatch):
     """Fix 10: CUDA failure retries on CPU and returns the CPU model."""
     monkeypatch.setenv("WHISPER_DEVICE", "cuda")
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def pick_device")
-    end = src.index("def split_audio_name")
 
     class StubCudaFailsCpuSucceeds:
         def __init__(self, name, device, compute_type, cpu_threads=0):
@@ -80,13 +116,18 @@ def test_cuda_exhausted_falls_back_to_cpu(monkeypatch):
             self.compute_type = compute_type
             self.cpu_threads = cpu_threads
 
-    ns = {
-        "os": os,
-        "json": json,
-        "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 1)}),
-        "WhisperModel": StubCudaFailsCpuSucceeds,
-    }
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    ns = load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "json": json,
+            "ctranslate2": type("ct", (), {
+                "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "WhisperModel": StubCudaFailsCpuSucceeds,
+        },
+    )
     model = ns["load_model"]()
     assert model.device == "cpu"
 
@@ -94,9 +135,6 @@ def test_cuda_exhausted_falls_back_to_cpu(monkeypatch):
 def test_cuda_success_makes_no_cpu_attempt(monkeypatch):
     """Fix 10: Successful CUDA load never attempts CPU."""
     monkeypatch.setenv("WHISPER_DEVICE", "cuda")
-    src = (ROOT / "mp3_to_json.py").read_text()
-    start = src.index("def pick_device")
-    end = src.index("def split_audio_name")
 
     class StubCudaSucceeds:
         devices_attempted = []
@@ -108,13 +146,18 @@ def test_cuda_success_makes_no_cpu_attempt(monkeypatch):
             self.compute_type = compute_type
             self.cpu_threads = cpu_threads
 
-    ns = {
-        "os": os,
-        "json": json,
-        "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 1)}),
-        "WhisperModel": StubCudaSucceeds,
-    }
-    exec(compile(src[start:end], "mp3_to_json.py", "exec"), ns)
+    ns = load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "json": json,
+            "ctranslate2": type("ct", (), {
+                "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "WhisperModel": StubCudaSucceeds,
+        },
+    )
     model = ns["load_model"]()
     assert model.device == "cuda"
     assert "cpu" not in StubCudaSucceeds.devices_attempted

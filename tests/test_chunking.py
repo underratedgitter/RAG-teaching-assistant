@@ -1,14 +1,9 @@
 """Tests for merge_segments — the chunking that retrieval quality depends on."""
-import types
-from pathlib import Path
+from _pipeline import load
 
 # Import merge_segments without running the module's top-level pipeline,
 # which reads jsons/ and calls Ollama.
-_src = (Path(__file__).parent.parent / "preprocess_json.py").read_text()
-_fn = _src[_src.index("def merge_segments"): _src.index('print("="*50)')]
-_mod = types.ModuleType("_merge")
-exec(compile(_fn, "preprocess_json.py", "exec"), _mod.__dict__)
-merge_segments = _mod.merge_segments
+merge_segments = load("preprocess_json.py", functions=["merge_segments"])["merge_segments"]
 
 
 def seg(text, start, end, number="1", title="L1"):
@@ -99,12 +94,17 @@ def test_scales_linearly_not_quadratically():
 
     def timed(n):
         segs = build(n=n)
-        t0 = time.perf_counter()
+        t0 = time.process_time()
         merge_segments(segs)
-        return time.perf_counter() - t0
+        return time.process_time() - t0
 
     timed(500)  # warm
-    small, large = timed(500), timed(4000)
+    # CPU time, not wall-clock: being descheduled makes a run look slow on
+    # the clock even though it did no more work, and that is what made this
+    # test fail under load on CI. The best of three is the run that was
+    # disturbed least.
+    small = min(timed(500) for _ in range(3))
+    large = min(timed(4000) for _ in range(3))
     # 8x the input should be well under 30x the time if it is linear
     assert large < small * 30, f"{small:.4f}s -> {large:.4f}s looks superlinear"
 
