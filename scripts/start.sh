@@ -42,12 +42,16 @@ requirements_hash() {
   "$py" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' requirements.txt
 }
 
+install_failed() {
+  die "Installing requirements failed (error above). A Python with no prebuilt wheels for your machine is the usual cause: delete $venv and run this again with Python 3.11 to 3.13, or with uv installed, which fetches one."
+}
+
 install_requirements() {
   say "Installing requirements"
   if command -v uv >/dev/null 2>&1; then
-    uv pip install --quiet --python "$py" -r requirements.txt
+    uv pip install --quiet --python "$py" -r requirements.txt || install_failed
   else
-    "$py" -m pip install --quiet --disable-pip-version-check -r requirements.txt
+    "$py" -m pip install --quiet --disable-pip-version-check -r requirements.txt || install_failed
   fi
   requirements_hash > "$stamp"
 }
@@ -64,7 +68,7 @@ say "Checking ffmpeg, Ollama and models"
 
 if [[ ${RAG_NO_GUI:-0} == 1 ]]; then
   "$py" -c 'import dashboard' || die "dashboard.py does not import. If the error mentions tkinter, install your Python's Tk package (macOS: brew install python-tk, Debian/Ubuntu: sudo apt install python3-tk)."
-  say "RAG_NO_GUI=1: setup and checks passed; not opening the window."
+  say "RAG_NO_GUI=1: setup finished and the dashboard imports; not opening the window."
   exit 0
 fi
 
