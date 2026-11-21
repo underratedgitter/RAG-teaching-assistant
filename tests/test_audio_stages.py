@@ -47,6 +47,30 @@ def test_zero_byte_audio_keeps_same_output_name(tmp_path, monkeypatch):
     assert jobs == [("1_lecture.mp4.mp3", "lecture.mp4")]
 
 
+def test_ffmpeg_is_told_not_to_read_stdin(tmp_path, monkeypatch):
+    """Four ffmpegs run at once from worker threads, inheriting the terminal.
+
+    Without -nostdin each one reads keystrokes from it (ffmpeg's interactive
+    keys), swallowing input meant for the user and stalling when backgrounded.
+    """
+    h = _video_helpers(tmp_path, monkeypatch)
+    (tmp_path / "videos" / "lecture.mp4").write_bytes(b"video data")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        Path(argv[-1]).write_bytes(b"audio")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, _ = h["convert_video"](("1_lecture.mp4.mp3", "lecture.mp4"))
+
+    assert ok
+    (argv,) = calls
+    assert "-nostdin" in argv
+    assert argv.index("-nostdin") < argv.index("-i")
+
+
 def test_non_dict_json_transcript_treated_as_corrupt(tmp_path, monkeypatch):
     """Fix 5: a [] transcript returns False, is removed, and does not raise."""
     monkeypatch.chdir(tmp_path)

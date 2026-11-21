@@ -164,6 +164,18 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
 session.mount('http://', adapter)
 session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
 
+def _vectors(response, texts):
+    """The embeddings in a reply, which must be one per text.
+
+    Chunks are matched to vectors by position, so a reply with fewer vectors
+    than texts would silently attach every later vector to the wrong chunk.
+    """
+    vectors = response.json()["embeddings"]
+    if len(vectors) != len(texts):
+        raise ValueError(f"Ollama returned {len(vectors)} embeddings for {len(texts)} texts")
+    return vectors
+
+
 def _embed_batch(batch):
     """Embed one batch, falling back to one-at-a-time if the batch fails."""
     try:
@@ -171,7 +183,7 @@ def _embed_batch(batch):
             json={"model": EMBED_MODEL, "input": batch},
             timeout=120)
         r.raise_for_status()
-        return r.json()["embeddings"]
+        return _vectors(r, batch)
     except requests.exceptions.RequestException as e:
         print(f"   [WARNING] Embedding request failed: {e}")
         if len(batch) == 1:
@@ -185,7 +197,7 @@ def _embed_batch(batch):
                 json={"model": EMBED_MODEL, "input": [text]},
                 timeout=120)
             r.raise_for_status()
-            out.extend(r.json()["embeddings"])
+            out.extend(_vectors(r, [text]))
         return out
 
 

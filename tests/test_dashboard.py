@@ -12,6 +12,10 @@ import queue
 import re
 import secrets
 import shutil
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -38,6 +42,7 @@ _METHODS = {
     "update_status",
     "upload_videos",
     "process_videos",
+    "run_script",
     "_clear_work_dirs_on_start",
     "ask_question",
     "_answer",
@@ -174,6 +179,8 @@ def _namespace():
         "os": os,
         "json": json,
         "shutil": shutil,
+        "subprocess": subprocess,
+        "sys": sys,
         "re": re,
         "secrets": secrets,
         "np": np,
@@ -331,6 +338,66 @@ def test_a_failing_copy_does_not_stop_the_batch(ns, tmp_path, monkeypatch):
     assert (videos / "good.mp4").read_bytes() == b"good"
     assert not (videos / "bad.mp4").exists()
     assert status_calls == [True]
+
+
+def test_a_copy_that_dies_midway_leaves_no_video_behind(ns, tmp_path, monkeypatch):
+    """A truncated copy must not pass for the upload on the next attempt.
+
+    The pipeline would convert it, and the lecture would be transcribed from
+    half a recording with nothing to say so.
+    """
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"the whole recording")
+    ns["filedialog"].askopenfilenames = lambda **kwargs: (str(source),)
+
+    real_copy = shutil.copy2
+
+    def dies_midway(src, dst):
+        Path(dst).write_bytes(b"the whole")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copy2", dies_midway)
+    app, logs, status_calls = _upload_app(videos)
+    ns["upload_videos"](app)
+    assert any("Could not upload lecture.mp4" in line for line in logs)
+    assert os.listdir(videos) == []
+
+    monkeypatch.setattr(shutil, "copy2", real_copy)
+    app, logs, status_calls = _upload_app(videos)
+    ns["upload_videos"](app)
+    assert "Uploaded: lecture.mp4" in logs
+    assert (videos / "lecture.mp4").read_bytes() == b"the whole recording"
+
+
+def test_script_output_reaches_the_terminal_while_the_script_runs(ns, tmp_path, monkeypatch):
+    """A child writing to a pipe buffers its output unless it is told not to.
+
+    preprocess_json.py prints without flushing, so the terminal stayed empty
+    for the whole embedding stage and only filled in when the script exited.
+    """
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+    (tmp_path / "child.py").write_text(
+        "import os, time\n"
+        "print('first line')\n"
+        "deadline = time.time() + 10\n"
+        "while not os.path.exists('go') and time.time() < deadline:\n"
+        "    time.sleep(0.05)\n"
+    )
+    lines = []
+    app = SimpleNamespace(base_dir=str(tmp_path), log_safe=lines.append)
+    runner = threading.Thread(target=ns["run_script"], args=(app, "child.py", "Child"))
+    runner.start()
+    try:
+        deadline = time.time() + 5
+        while "first line" not in lines and time.time() < deadline:
+            time.sleep(0.05)
+        seen_while_running = "first line" in lines
+    finally:
+        (tmp_path / "go").write_text("")
+        runner.join(timeout=15)
+    assert seen_while_running
 
 
 def test_process_videos_survives_a_missing_folder(ns, tmp_path):
@@ -502,6 +569,34 @@ def test_the_question_cannot_close_its_own_block(ns):
 
     assert prompt.count("</question-") == 1
     assert prompt.count("</question-abc>") == 1
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_a_non_finite_timestamp_does_not_break_the_prompt(ns, bad):
+    """A transcript can carry Infinity: json reads it, int() cannot convert it."""
+    rows = [{"number": 1, "title": "L", "start": bad, "end": 30, "text": "hi"}]
+    prompt = ns["build_prompt"](rows, "q", "abc")
+
+    assert 'time="0:00-0:30"' in prompt
+
+
+def test_a_failing_widget_update_does_not_lock_the_buttons(ns):
+    """Tk can refuse a reply (older Tk rejects characters outside the BMP).
+
+    The busy flag is cleared by the same call, so an exception from the text
+    widget left Ask and Process disabled until the app was restarted.
+    """
+    app = _busy_app(ns, answering=True)
+
+    def refuse(index, text):
+        raise RuntimeError("character is above the range allowed by Tcl")
+
+    app.response_text.insert = refuse
+    with pytest.raises(RuntimeError):
+        ns["_show_response"](app, "answer \U0001F600")
+
+    assert app._answering is False
+    assert app.ask_btn.state == "normal"
 
 
 def test_a_title_with_a_newline_stays_on_the_attribute_line(ns):

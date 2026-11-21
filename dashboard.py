@@ -117,7 +117,7 @@ def _time_parts(value):
     """Seconds as (minutes, seconds), for the timestamp shown to the model."""
     try:
         return divmod(int(value), 60)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # None, NaN, infinity
         return (0, 0)
 
 
@@ -593,11 +593,20 @@ class RAGDashboard:
                 if os.path.exists(dest):
                     self.log(f"Skipped (already uploaded): {name}")
                     continue
+                # Copy under a name _is_video rejects and rename when done: a
+                # copy that dies midway must not leave a truncated recording
+                # that the next upload skips and the pipeline transcribes.
+                partial = os.path.join(self.videos_dir, f".{name}.partial")
                 try:
-                    shutil.copy2(f, dest)
+                    shutil.copy2(f, partial)
+                    os.replace(partial, dest)
                 except OSError as e:
                     # One unreadable file must not abort the whole batch.
                     self.log(f"Could not upload {name}: {e}")
+                    try:
+                        os.remove(partial)
+                    except OSError:
+                        pass
                     continue
                 self.log(f"Uploaded: {name}")
             self.update_status()
@@ -629,7 +638,9 @@ class RAGDashboard:
         self.log_safe(f"{'='*40}")
 
         process = subprocess.Popen(
-            [sys.executable, script_name],
+            # -u: a piped child block-buffers its output, so scripts that do not
+            # flush would show nothing until they exit.
+            [sys.executable, "-u", script_name],
             cwd=self.base_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -796,10 +807,14 @@ class RAGDashboard:
             session.close()
 
     def _show_response(self, text):
-        self.response_text.delete("1.0", "end")
-        self.response_text.insert("1.0", text)
-        self._answering = False
-        self._sync_buttons()
+        # The flag is cleared even if the widget refuses the text, or the
+        # buttons would stay locked.
+        try:
+            self.response_text.delete("1.0", "end")
+            self.response_text.insert("1.0", text)
+        finally:
+            self._answering = False
+            self._sync_buttons()
 
 
 if __name__ == "__main__":

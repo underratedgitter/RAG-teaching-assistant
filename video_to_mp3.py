@@ -242,7 +242,7 @@ def convert_video(args):
 
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", f"videos/{file}",
+            ["ffmpeg", "-nostdin", "-y", "-i", f"videos/{file}",
              "-vn",
              # Whisper works at 16 kHz mono and resamples anything else, so
              # producing that directly is cheaper to encode, smaller on disk,

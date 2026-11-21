@@ -29,7 +29,7 @@ def load_module(monkeypatch, model="nomic-embed-text"):
     return load(
         "preprocess_json.py",
         functions={
-            "cache_key", "load_cached", "save_cached", "_embed_batch",
+            "cache_key", "load_cached", "save_cached", "_vectors", "_embed_batch",
             "create_embedding",
         },
         constants={
@@ -238,6 +238,29 @@ def test_a_failing_batch_propagates(monkeypatch):
     m["_embed_batch"] = boom
     with pytest.raises(RuntimeError):
         m["create_embedding"]([f"{c}0" for c in "abcde"], batch_size=1)
+
+
+def test_a_short_reply_is_an_error_not_a_misalignment(monkeypatch):
+    """Fewer vectors than texts would shift every later chunk onto the wrong embedding."""
+    m = load_module(monkeypatch)
+
+    class FakeResponse:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"embeddings": [[float(len(t))] for t in self.texts[:-1]]}
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            return FakeResponse(json["input"])
+
+    m["session"] = FakeSession()
+    with pytest.raises(ValueError):
+        m["create_embedding"](["a", "bb", "ccc", "dddd"], batch_size=2)
 
 
 def test_failed_batch_with_failing_single_text_raises(monkeypatch):
