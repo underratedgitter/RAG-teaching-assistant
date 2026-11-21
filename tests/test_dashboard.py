@@ -24,12 +24,15 @@ import pandas as pd
 import pytest
 import requests
 
+import preflight
+
 DASHBOARD = Path(__file__).parents[1] / "dashboard.py"
 
 # The artifact the old pipeline wrote; it may be named, but never unpickled.
 LEGACY_ARTIFACT = "embeddings.joblib"
 
 _FUNCTIONS = {
+    "_abort_on_bad_settings",
     "_matrix_matches_dataframe",
     "_is_video",
     "_clean_field",
@@ -49,11 +52,17 @@ _METHODS = {
     "_answer",
     "_show_response",
     "_sync_buttons",
+    "_startup",
+    "_run_preflight",
+    "recheck_setup",
+    "_apply_preflight",
+    "_warm_models",
 }
 _CONSTANTS = {
     "TOP_K",
     "SIMILARITY_THRESHOLD",
     "FALLBACK_K",
+    "OLLAMA_TIMEOUT",
     "OLLAMA_URL",
     "EMBED_MODEL",
     "ANSWER_MODEL",
@@ -187,6 +196,7 @@ def _namespace():
         "np": np,
         "pd": pd,
         "requests": requests,
+        "preflight": preflight,
         "threading": _StubThreading(),
         "filedialog": SimpleNamespace(askopenfilenames=lambda **kwargs: ()),
         "messagebox": SimpleNamespace(
@@ -474,6 +484,7 @@ def _busy_app(ns, processing=False, answering=False):
         ask_btn=_StubButton(),
         process_btn=_StubButton(),
         df="a corpus",
+        _problems=[],
         _processing=processing,
         _answering=answering,
         log=lambda text: None,
@@ -777,3 +788,345 @@ def test_the_search_line_reports_the_top_k(ns):
     ns["_answer"](app, "What is this?")
 
     assert f"Searching... (top {ns['TOP_K']} results)" in logs
+
+
+# ── startup checks lock only what they block ───────────────────────────────
+
+_NO_FFMPEG = preflight.Problem("ffmpeg", "ffmpeg was not found on PATH.",
+                               "brew install ffmpeg", (preflight.PROCESS,))
+_NO_ANSWER_MODEL = preflight.Problem("model m", "The answer model m is not pulled.",
+                                     "ollama pull m", (preflight.ASK,))
+_NO_OLLAMA = preflight.Problem("ollama", "Ollama is not reachable at http://x.",
+                               "ollama serve", (preflight.PROCESS, preflight.ASK))
+
+
+def test_buttons_are_enabled_when_every_check_passed(ns):
+    app = _busy_app(ns)
+    ns["_sync_buttons"](app)
+    assert (app.ask_btn.state, app.process_btn.state) == ("normal", "normal")
+
+
+def test_a_missing_ffmpeg_disables_only_processing(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_FFMPEG]
+    ns["_sync_buttons"](app)
+    assert (app.ask_btn.state, app.process_btn.state) == ("normal", "disabled")
+
+
+def test_a_missing_answer_model_disables_only_asking(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_ANSWER_MODEL]
+    ns["_sync_buttons"](app)
+    assert (app.ask_btn.state, app.process_btn.state) == ("disabled", "normal")
+
+
+def test_an_unreachable_ollama_disables_both(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_OLLAMA]
+    ns["_sync_buttons"](app)
+    assert (app.ask_btn.state, app.process_btn.state) == ("disabled", "disabled")
+
+
+def test_a_problem_that_is_fixed_re_enables_the_action(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_ANSWER_MODEL]
+    ns["_sync_buttons"](app)
+    app._problems = []
+    ns["_sync_buttons"](app)
+    assert app.ask_btn.state == "normal"
+
+
+def test_asking_with_a_missing_model_shows_the_fix_and_starts_nothing(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_ANSWER_MODEL]
+    ns["ask_question"](app)
+    assert ns["threading"].threads == []
+    assert "ollama pull m" in app.response_text.text
+
+
+def test_a_problem_that_does_not_block_asking_does_not_stop_a_question(ns):
+    app = _busy_app(ns)
+    app._problems = [_NO_FFMPEG]
+    ns["ask_question"](app)
+    assert len(ns["threading"].threads) == 1
+
+
+class _StubPacked(_StubButton):
+    """A label or button that records pack and pack_forget calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.packed = None
+
+    def pack(self, **kwargs):
+        self.packed = True
+
+    def pack_forget(self):
+        self.packed = False
+
+
+def _setup_app(ns):
+    app = _busy_app(ns)
+    app.setup_label = _StubPacked()
+    app.status_label = _StubPacked()
+    app.recheck_btn = _StubButton()
+    return app
+
+
+def test_applying_problems_shows_each_message_and_fix(ns):
+    app = _setup_app(ns)
+    ns["_apply_preflight"](app, [_NO_FFMPEG, _NO_ANSWER_MODEL])
+    text = app.setup_label.configs[-1]["text"]
+    assert "brew install ffmpeg" in text and "ollama pull m" in text
+    assert app.setup_label.packed is True
+    assert app.process_btn.state == "disabled" and app.ask_btn.state == "disabled"
+    assert app.recheck_btn.state == "normal"
+
+
+def test_applying_no_problems_hides_the_message_and_unlocks(ns):
+    app = _setup_app(ns)
+    ns["_apply_preflight"](app, [_NO_OLLAMA])
+    ns["_apply_preflight"](app, [])
+    assert app.setup_label.packed is False
+    assert app.process_btn.state == "normal" and app.ask_btn.state == "normal"
+
+
+def _preflight_app(ns, monkeypatch, problems):
+    monkeypatch.setattr(preflight, "run_checks", lambda *args: problems)
+    lines = []
+    app = SimpleNamespace(_ui_queue=queue.Queue(), log_safe=lines.append, _problems=[])
+    return app, lines
+
+
+def test_a_failed_check_reaches_the_terminal_and_the_ui(ns, monkeypatch, capsys):
+    app, lines = _preflight_app(ns, monkeypatch, [_NO_FFMPEG])
+    blocked = ns["_run_preflight"](app)
+
+    assert blocked == {preflight.PROCESS}
+    assert "brew install ffmpeg" in lines[0]
+    assert "brew install ffmpeg" in capsys.readouterr().err
+    assert app._ui_queue.qsize() == 1
+
+
+def test_a_clean_check_says_so(ns, monkeypatch):
+    app, lines = _preflight_app(ns, monkeypatch, [])
+    assert ns["_run_preflight"](app) == frozenset()
+    assert lines[0].startswith("✓ Setup checks passed")
+
+
+def test_the_check_runs_against_the_configured_ollama_and_models(ns, monkeypatch):
+    seen = []
+    monkeypatch.setattr(preflight, "run_checks", lambda *args: seen.append(args) or [])
+    app = SimpleNamespace(_ui_queue=queue.Queue(), log_safe=lambda text: None)
+    ns["_run_preflight"](app)
+    assert seen == [(ns["OLLAMA_URL"], ns["EMBED_MODEL"], ns["ANSWER_MODEL"])]
+
+
+@pytest.mark.parametrize("blocked, warmed", [
+    (frozenset(), True),
+    (frozenset({preflight.PROCESS}), True),
+    (frozenset({preflight.ASK}), False),
+])
+def test_models_are_warmed_only_when_asking_works(ns, blocked, warmed):
+    calls = []
+    app = SimpleNamespace(
+        _ensure_ollama_running=lambda: calls.append("ensure"),
+        _run_preflight=lambda: blocked,
+        _warm_models=lambda: calls.append("warm"),
+    )
+    ns["_startup"](app)
+    assert calls == (["ensure", "warm"] if warmed else ["ensure"])
+
+
+def test_rechecking_locks_the_button_and_runs_the_checks_off_the_tk_thread(ns):
+    app = SimpleNamespace(recheck_btn=_StubButton(), _run_preflight=lambda: None)
+    ns["recheck_setup"](app)
+    assert app.recheck_btn.state == "disabled"
+    [thread] = ns["threading"].threads
+    assert thread.target is app._run_preflight and thread.daemon is True
+
+
+# ── query-time Ollama errors are readable and leave the UI usable ──────────
+
+class _BrokenSession(_StubSession):
+    """Fails the request to one endpoint, as Ollama would."""
+
+    def __init__(self, endpoint, failure):
+        super().__init__()
+        self.endpoint = endpoint
+        self.failure = failure
+
+    def post(self, url, json=None, timeout=None):
+        if url.endswith(self.endpoint):
+            raise self.failure
+        return super().post(url, json=json, timeout=timeout)
+
+
+class _HttpFailure(_StubResponse):
+    def __init__(self, status, payload):
+        super().__init__(payload)
+        self.status_code = status
+
+    def raise_for_status(self):
+        raise requests.HTTPError("boom", response=self)
+
+
+class _HttpFailingSession(_StubSession):
+    def __init__(self, endpoint, status, payload):
+        super().__init__()
+        self.endpoint = endpoint
+        self.reply = _HttpFailure(status, payload)
+
+    def post(self, url, json=None, timeout=None):
+        if url.endswith(self.endpoint):
+            return self.reply
+        return super().post(url, json=json, timeout=timeout)
+
+
+def _fail_with(ns, session):
+    df, matrix = _corpus([0.9])
+    app, _, logs = _answer_app(df, matrix)
+    app._new_session = lambda: session
+    ns["_answer"](app, "What is this?")
+    return _shown(app), logs
+
+
+@pytest.mark.parametrize("endpoint", ["/api/embed", "/api/generate"])
+def test_a_refused_connection_is_a_message_not_a_traceback(ns, endpoint):
+    shown, logs = _fail_with(ns, _BrokenSession(endpoint, requests.ConnectionError("refused")))
+    assert shown == "Error: Cannot connect to Ollama. Start it with: ollama serve"
+    assert logs[-1] == shown
+
+
+def test_a_slow_answer_model_names_the_model_and_the_setting(ns):
+    shown, _ = _fail_with(ns, _BrokenSession("/api/generate", requests.ReadTimeout("slow")))
+    assert shown.startswith("Error: Ollama did not answer in time")
+    assert ns["ANSWER_MODEL"] in shown and "OLLAMA_TIMEOUT" in shown
+
+
+def test_a_slow_embedding_model_names_that_model(ns):
+    shown, _ = _fail_with(ns, _BrokenSession("/api/embed", requests.ReadTimeout("slow")))
+    assert ns["EMBED_MODEL"] in shown
+
+
+def test_a_missing_answer_model_says_how_to_pull_it(ns):
+    session = _HttpFailingSession(
+        "/api/generate", 404, {"error": 'model "qwen2.5:1.5b" not found, try pulling it first'})
+    shown, _ = _fail_with(ns, session)
+    assert shown == (f"Error: The model {ns['ANSWER_MODEL']} is not pulled. "
+                     f"Pull it with: ollama pull {ns['ANSWER_MODEL']}")
+
+
+def test_a_missing_embedding_model_blames_the_embedding_model(ns):
+    session = _HttpFailingSession(
+        "/api/embed", 404, {"error": 'model "nomic-embed-text" not found, try pulling it first'})
+    shown, _ = _fail_with(ns, session)
+    assert f"ollama pull {ns['EMBED_MODEL']}" in shown
+
+
+def test_an_unreadable_reply_is_reported_and_the_buttons_unlock(ns):
+    class _Odd(_StubSession):
+        def post(self, url, json=None, timeout=None):
+            return _StubResponse({"unexpected": True})
+
+    df, matrix = _corpus([0.9])
+    app, _, logs = _answer_app(df, matrix)
+    app._new_session = lambda: _Odd()
+    ns["_answer"](app, "What is this?")
+    shown = _shown(app)
+    assert shown.startswith("Error: Ollama sent a reply this program cannot read")
+
+
+def test_the_buttons_unlock_after_a_failed_answer(ns):
+    app = _busy_app(ns, answering=True)
+    ns["_show_response"](app, "Error: Cannot connect to Ollama. Start it with: ollama serve")
+    assert app._answering is False
+    assert app.ask_btn.state == "normal"
+
+
+def test_requests_use_the_configured_timeout(ns, monkeypatch):
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "240")
+    ns = _namespace()
+    timeouts = []
+
+    class _Recording(_StubSession):
+        def post(self, url, json=None, timeout=None):
+            timeouts.append(timeout)
+            return super().post(url, json=json, timeout=timeout)
+
+    df, matrix = _corpus([0.9])
+    app, _, _ = _answer_app(df, matrix)
+    app._new_session = lambda: _Recording()
+    ns["_answer"](app, "What is this?")
+    assert timeouts == [240, 240]
+
+
+# ── settings can be overridden from the environment ────────────────────────
+
+def test_retrieval_and_timeout_settings_default_to_the_documented_values(monkeypatch):
+    for name in ("TOP_K", "FALLBACK_K", "OLLAMA_TIMEOUT", "SIMILARITY_THRESHOLD"):
+        monkeypatch.delenv(name, raising=False)
+    ns = _namespace()
+    assert (ns["TOP_K"], ns["FALLBACK_K"], ns["OLLAMA_TIMEOUT"]) == (8, 3, 120)
+    assert ns["SIMILARITY_THRESHOLD"] == 0.3
+
+
+def test_the_environment_overrides_every_dashboard_setting(monkeypatch):
+    for name, value in {"TOP_K": "12", "FALLBACK_K": "5", "OLLAMA_TIMEOUT": "300",
+                        "SIMILARITY_THRESHOLD": "0.5", "OLLAMA_URL": "http://box:11434",
+                        "EMBED_MODEL": "mxbai-embed-large", "ANSWER_MODEL": "llama3.2"}.items():
+        monkeypatch.setenv(name, value)
+    ns = _namespace()
+    assert (ns["TOP_K"], ns["FALLBACK_K"], ns["OLLAMA_TIMEOUT"]) == (12, 5, 300)
+    assert ns["SIMILARITY_THRESHOLD"] == 0.5
+    assert ns["OLLAMA_URL"] == "http://box:11434"
+    assert (ns["EMBED_MODEL"], ns["ANSWER_MODEL"]) == ("mxbai-embed-large", "llama3.2")
+
+
+class _StubTk:
+    """Stands in for tkinter: records the error dialog, or fails like a headless host."""
+
+    class TclError(Exception):
+        pass
+
+    def __init__(self, headless=False):
+        self.headless = headless
+        self.dialogs = []
+
+    def Tk(self):
+        if self.headless:
+            raise self.TclError("no display")
+        return SimpleNamespace(withdraw=lambda: None, destroy=lambda: None)
+
+
+def _settings_check(ns, tk, monkeypatch, **env):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    ns["tk"] = tk
+    ns["messagebox"] = SimpleNamespace(
+        showerror=lambda title, text: tk.dialogs.append(text))
+
+
+def test_a_bad_setting_stops_the_dashboard_with_a_dialog_and_a_message(ns, monkeypatch, capsys):
+    tk = _StubTk()
+    _settings_check(ns, tk, monkeypatch, TOP_K="many")
+    with pytest.raises(SystemExit) as stop:
+        ns["_abort_on_bad_settings"]()
+    assert stop.value.code == 1
+    assert "TOP_K='many' must be a whole number" in capsys.readouterr().err
+    assert "TOP_K='many'" in tk.dialogs[0]
+
+
+def test_a_bad_setting_still_stops_a_headless_host_with_the_terminal_message(
+        ns, monkeypatch, capsys):
+    _settings_check(ns, _StubTk(headless=True), monkeypatch, SIMILARITY_THRESHOLD="high")
+    with pytest.raises(SystemExit):
+        ns["_abort_on_bad_settings"]()
+    assert "SIMILARITY_THRESHOLD='high'" in capsys.readouterr().err
+
+
+def test_valid_settings_let_the_dashboard_start(ns, monkeypatch):
+    tk = _StubTk()
+    _settings_check(ns, tk, monkeypatch, TOP_K="12")
+    ns["_abort_on_bad_settings"]()
+    assert tk.dialogs == []

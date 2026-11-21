@@ -17,14 +17,43 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
+import preflight
+
+
+def _abort_on_bad_settings():
+    """Refuse to start on an unusable environment variable, saying which.
+
+    The settings below are parsed at import, so an unchecked bad value would
+    be a traceback before any window exists.
+    """
+    errors = preflight.check_config()
+    if not errors:
+        return
+    text = "Invalid settings:\n" + "\n".join(f"- {error}" for error in errors)
+    print(text, file=sys.stderr)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("RAG Teaching Assistant", text)
+        root.destroy()
+    except tk.TclError:
+        pass                    # no display: the terminal message stands
+    sys.exit(1)
+
+
+_abort_on_bad_settings()
+
 # ── Retrieval tuning ─────────────────────────────────────────────────────────
 # Raise TOP_K to give the model more context at the cost of a longer prompt;
 # raise the threshold to be stricter about relevance.
-TOP_K = 8                   # chunks considered for the answer
+TOP_K = int(os.environ.get("TOP_K", "8"))    # chunks considered for the answer
 # A fixed cut-off cannot be validated for every embedding model, so it is
 # configurable; the default keeps the previous behaviour.
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
-FALLBACK_K = 3              # used when nothing clears the threshold
+FALLBACK_K = int(os.environ.get("FALLBACK_K", "3"))    # used when nothing clears the threshold
+# Seconds to wait for Ollama to embed a question or write an answer. A cold
+# model on a slow machine can need longer than the default.
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
@@ -204,6 +233,10 @@ class RAGDashboard:
         # that is being replaced underneath it.
         self._processing = False
         self._answering = False
+        # What the startup checks found missing. Each problem disables only
+        # the actions it blocks, and the list is empty until the first check
+        # finishes.
+        self._problems = []
         # The only thing a worker thread may do to the UI is put onto this:
         # a str is a terminal line, anything else is called on the Tk thread.
         self._ui_queue = queue.Queue()
@@ -228,11 +261,7 @@ class RAGDashboard:
 
             self.create_ui()
 
-            # Auto-start Ollama if not running
-            threading.Thread(target=self._ensure_ollama_running, daemon=True).start()
-
-            # Pre-warm Ollama models in background so first query is fast
-            threading.Thread(target=self._warm_models, daemon=True).start()
+            threading.Thread(target=self._startup, daemon=True).start()
 
         except Exception as e:
             print(f"Error during initialization: {e}")
@@ -295,10 +324,15 @@ class RAGDashboard:
         self.process_btn = tk.Button(btn_frame, text="Process Videos", command=self.process_videos)
         self.process_btn.pack(side="left", padx=(0,5))
         tk.Button(btn_frame, text="Open Folder", command=self.open_videos_folder).pack(side="left", padx=(0,5))
-        tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left")
+        tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left", padx=(0,5))
+        self.recheck_btn = tk.Button(btn_frame, text="Re-check Setup", command=self.recheck_setup)
+        self.recheck_btn.pack(side="left")
 
         self.status_label = tk.Label(self.root, text="", fg="gray")
         self.status_label.pack(anchor="w", padx=10, pady=5)
+
+        # Shown only while the startup checks have something to report.
+        self.setup_label = tk.Label(self.root, text="", fg="red", justify="left", wraplength=660)
 
         # Separator
         tk.Frame(self.root, height=1, bg="gray").pack(fill="x", padx=10, pady=5)
@@ -396,21 +430,58 @@ class RAGDashboard:
             self.log_safe("⚠ Ollama not responding. Make sure Ollama is installed and run: ollama serve")
         return False
 
+    def _startup(self):
+        """Start Ollama if needed, check the setup, then warm the models."""
+        self._ensure_ollama_running()
+        if preflight.ASK not in self._run_preflight():
+            # Pre-warm so the first question is not slowed by loading the models.
+            self._warm_models()
+
+    def _run_preflight(self):
+        """Check every external piece, report it, and return the actions it blocks.
+
+        Runs on a worker thread: the checks touch the network and start a
+        child process. The result reaches the widgets through the queue.
+        """
+        problems = preflight.run_checks(OLLAMA_URL, EMBED_MODEL, ANSWER_MODEL)
+        if problems:
+            report = preflight.format_problems(problems)
+            print(f"[SETUP] Some checks failed:\n{report}", file=sys.stderr)
+            self.log_safe("⚠ Setup problems found:\n" + report)
+        else:
+            self.log_safe("✓ Setup checks passed: ffmpeg, faster-whisper, Ollama and both models.")
+        self._ui_queue.put(lambda: self._apply_preflight(problems))
+        return preflight.blocked_actions(problems)
+
+    def recheck_setup(self):
+        """Run the checks again, after the user has fixed something."""
+        self.recheck_btn.config(state="disabled")
+        threading.Thread(target=self._run_preflight, daemon=True).start()
+
+    def _apply_preflight(self, problems):
+        """Show the problems and lock only what they block (Tk thread only)."""
+        self._problems = problems
+        if problems:
+            self.setup_label.config(text="Setup incomplete (details and fixes in the terminal):\n"
+                                    + "\n".join(f"• {p.message}  Fix: {p.fix}" for p in problems))
+            self.setup_label.pack(anchor="w", padx=10, after=self.status_label)
+        else:
+            self.setup_label.pack_forget()
+        self.recheck_btn.config(state="normal")
+        self._sync_buttons()
+
     def _warm_models(self):
         """Pre-warm Ollama models to avoid cold-start latency."""
         try:
-            # Wait a bit for Ollama to be ready
-            time.sleep(2)
-
             with self._new_session() as session:
                 session.post(f"{OLLAMA_URL}/api/embed",
-                    json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=30)
+                    json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=OLLAMA_TIMEOUT)
                 session.post(f"{OLLAMA_URL}/api/generate",
                     json={"model": ANSWER_MODEL, "prompt": "hi", "stream": False,
-                          "options": {"num_predict": 1}}, timeout=30)
+                          "options": {"num_predict": 1}}, timeout=OLLAMA_TIMEOUT)
             self.log_safe("✓ Ollama models warmed up - ready for queries.")
-        except Exception:
-            self.log_safe("⚠ Model warm-up in progress... (this is normal)")
+        except Exception as e:
+            self.log_safe(f"⚠ Model warm-up failed: {preflight.describe_ollama_error(e, ANSWER_MODEL)}")
 
     def _new_session(self):
         """An HTTP session for one worker thread, which must close it.
@@ -715,11 +786,13 @@ class RAGDashboard:
         """Derive both buttons from the busy flags, so no caller can re-enable
         one while the other operation still needs it locked."""
         busy = self._processing or self._answering
+        blocked = preflight.blocked_actions(self._problems)
         self.process_btn.config(
-            state="disabled" if busy else "normal",
+            state="disabled" if busy or preflight.PROCESS in blocked else "normal",
             text="Processing..." if self._processing else "Process Videos",
         )
-        self.ask_btn.config(state="disabled" if busy else "normal")
+        self.ask_btn.config(
+            state="disabled" if busy or preflight.ASK in blocked else "normal")
 
     def _status(self, text):
         self._ui_queue.put(lambda: self.status_label.config(text=text))
@@ -732,6 +805,12 @@ class RAGDashboard:
         # question start mid-processing (while embeddings reload) or overlap
         # an answer already in flight.
         if self._processing or self._answering:
+            return
+        # The Return binding bypasses the disabled Ask button here too.
+        missing = [p for p in self._problems if preflight.ASK in p.blocks]
+        if missing:
+            self.response_text.delete("1.0", "end")
+            self.response_text.insert("1.0", "Cannot answer yet:\n" + preflight.format_problems(missing))
             return
         if self.df is None:
             messagebox.showwarning("No Data", "Process videos first!")
@@ -746,11 +825,12 @@ class RAGDashboard:
 
     def _answer(self, question):
         session = self._new_session()
+        model = EMBED_MODEL     # the model of the request in flight, named if it fails
         try:
             self.log_safe("Creating embedding...")
             r = session.post(f"{OLLAMA_URL}/api/embed",
                 json={"model": EMBED_MODEL, "input": [QUERY_PREFIX + question]},
-                timeout=30)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
             q_embed = r.json()["embeddings"][0]
 
@@ -792,6 +872,7 @@ class RAGDashboard:
             chunks = df.iloc[top_idx]
 
             self.log_safe("Generating response...")
+            model = ANSWER_MODEL
             # The tag is random per request, so the system prompt cannot know
             # it in advance and pasted content cannot close its own block.
             tag = secrets.token_hex(8)
@@ -806,23 +887,18 @@ class RAGDashboard:
                     "stream": False,
                     "options": {**GENERATION_OPTIONS, "temperature": 0.2, "top_p": 0.9}
                 },
-                timeout=120)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
             response = f'{r.json()["response"]}\n\n{format_sources(rows)}'
 
             self.log_safe("Done!")
             self._ui_queue.put(lambda: self._show_response(response))
-        except requests.exceptions.Timeout:
-            self.log_safe("Error: Request timeout (is Ollama running?)")
-            self._ui_queue.put(lambda: self._show_response("Error: Connection timeout. Make sure Ollama is running: ollama serve"))
-        except requests.exceptions.ConnectionError:
-            self.log_safe("Error: Cannot connect to Ollama")
-            self._ui_queue.put(lambda: self._show_response("Error: Cannot connect to Ollama. Start it with: ollama serve"))
         except Exception as e:
-            self.log_safe(f"Error: {e}")
             # Bind the message now: Python unbinds `e` when the except block
-            # ends, before Tk runs the callback.
-            message = f"Error: {e}"
+            # ends, before Tk runs the callback. Whatever went wrong is shown
+            # in the answer area, never raised, so the window stays usable.
+            message = f"Error: {preflight.describe_ollama_error(e, model)}"
+            self.log_safe(message)
             self._ui_queue.put(lambda: self._show_response(message))
         finally:
             session.close()

@@ -3,6 +3,11 @@ import os
 import sys
 import time
 
+import preflight
+
+# Before the heavy imports below, so a missing package is a message, not a traceback.
+preflight.require(whisper=True)
+
 import ctranslate2
 from faster_whisper import WhisperModel
 

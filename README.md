@@ -33,7 +33,7 @@ If the `small` model won't load it degrades to `base`, then `tiny`, and each siz
 
 Embeddings are cached per file under `.embed_cache/`, keyed by a hash of that file's chunk text and the model name. Adding one lecture to a library of twenty re-embeds one lecture, not twenty. Editing a transcript or switching embedding model invalidates only what changed.
 
-Each script exits `0` when every input succeeded, `2` when some inputs failed but the rest were processed, and `1` when inputs were given but none could be processed (`preprocess_json.py` also exits `1` when there are no transcripts at all). The dashboard carries on past a `2`, so one unreadable lecture does not block the others, and says which stage had failures.
+Each script first checks the tools it depends on and exits `1` with a fix if one is missing (see [Startup checks](#startup-checks)). Then it exits `0` when every input succeeded, `2` when some inputs failed but the rest were processed, and `1` when inputs were given but none could be processed (`preprocess_json.py` also exits `1` when there are no transcripts at all). The dashboard carries on past a `2`, so one unreadable lecture does not block the others, and says which stage had failures.
 
 The dashboard also checks model identity before loading saved embeddings. After
 changing `EMBED_MODEL`, run **Process Videos** again to regenerate embeddings
@@ -90,22 +90,53 @@ ollama pull qwen2.5:1.5b         # answering
 
 ### Settings
 
-Everything is overridable by environment variable:
+Everything is overridable by environment variable, and every value is validated
+before anything runs (see [Startup checks](#startup-checks)):
 
-| Variable | Default | Does |
+| Variable | Default | Valid values | Does |
+|---|---|---|---|
+| `WHISPER_MODEL` | `small` on CUDA, else `base` | a Whisper size (`tiny`, `base`, `small`, `medium`, `large-v3`, `turbo`, `distil-*`, a `.en` variant), a Hugging Face repo id or a local model directory | transcription accuracy vs speed |
+| `WHISPER_DEVICE` | auto | `cpu`, `cuda` | force the device |
+| `WHISPER_COMPUTE_TYPE` | `float16` on CUDA, else `int8` | `int8`, `int8_float16`, `int8_float32`, `int16`, `float16`, `bfloat16`, `float32` | weight precision |
+| `WHISPER_BEAM_SIZE` | `1` | whole number, 1-20 | raise to 5 for hard-to-hear audio |
+| `WHISPER_VAD` | `1` | `0`, `1` | `0` transcribes silence too |
+| `WHISPER_CPU_THREADS` | all cores | whole number, 0-512 (`0` = all cores) | encoder threads on a CPU run |
+| `OLLAMA_URL` | `http://localhost:11434` | an `http://` or `https://` address | where Ollama listens |
+| `OLLAMA_TIMEOUT` | `120` | whole number of seconds, 1-3600 | how long the dashboard waits for Ollama to embed a question or write an answer; raise it on a slow machine |
+| `EMBED_MODEL` | `nomic-embed-text` | an Ollama model name | embedding model |
+| `EMBED_CONCURRENCY` | `3` | whole number, 1-32 | embedding batches in flight at once |
+| `ANSWER_MODEL` | `qwen2.5:1.5b` | an Ollama model name | answering model |
+| `SIMILARITY_THRESHOLD` | `0.3` | number, -1 to 1 | cosine similarity below which a chunk is treated as unrelated |
+| `TOP_K` | `8` | whole number, 1-100 | chunks passed to the model as context |
+| `FALLBACK_K` | `3` | whole number, 1-100 | chunks used when nothing clears the threshold |
+| `CLEAR_ON_START` | unset | `0`, `1` | `1` wipes the derived work (audio, transcripts, embeddings) on launch, for a clean demo; `videos/` is kept |
+
+### Startup checks
+
+The dashboard checks its setup at launch, and each pipeline script checks what
+it needs before it starts. Nothing is guessed: a missing piece is reported with
+the command that fixes it.
+
+| Check | Fix shown | Disables |
 |---|---|---|
-| `WHISPER_MODEL` | `small` on CUDA, else `base` | transcription accuracy vs speed |
-| `WHISPER_DEVICE` | auto | force `cuda` or `cpu` |
-| `WHISPER_COMPUTE_TYPE` | `float16` on CUDA, else `int8` | weight precision |
-| `WHISPER_BEAM_SIZE` | `1` | raise to 5 for hard-to-hear audio |
-| `WHISPER_VAD` | `1` | `0` transcribes silence too |
-| `WHISPER_CPU_THREADS` | all cores | encoder threads on a CPU run |
-| `OLLAMA_URL` | `http://localhost:11434` | where Ollama listens |
-| `EMBED_MODEL` | `nomic-embed-text` | embedding model |
-| `EMBED_CONCURRENCY` | `3` | embedding batches in flight at once |
-| `ANSWER_MODEL` | `qwen2.5:1.5b` | answering model |
-| `SIMILARITY_THRESHOLD` | `0.3` | cosine similarity below which a chunk is treated as unrelated |
-| `CLEAR_ON_START` | unset | `1` wipes the derived work (audio, transcripts, embeddings) on launch, for a clean demo; `videos/` is kept |
+| `ffmpeg` on `PATH` | `brew install ffmpeg`, `winget install ffmpeg` or `sudo apt install ffmpeg` | Process Videos |
+| `faster-whisper` imports | `python -m pip install -r requirements.txt` | Process Videos |
+| Ollama answers at `OLLAMA_URL` | `ollama serve` | Process Videos and Ask |
+| `EMBED_MODEL` is pulled | `ollama pull nomic-embed-text` (or your model) | Process Videos and Ask |
+| `ANSWER_MODEL` is pulled | `ollama pull qwen2.5:1.5b` (or your model) | Ask |
+
+Problems appear in red under the buttons and in the terminal pane (and on the
+launching terminal), and only the buttons that need the missing piece are
+disabled. Fix the problem, then click **Re-check Setup**; no restart is needed.
+A script run on its own prints the same message to stderr and exits `1`.
+
+An invalid setting is reported by name and the reason (for example
+`TOP_K='many' must be a whole number`) before anything starts; the dashboard
+shows it in a dialog and exits `1`.
+
+If Ollama fails while you are asking a question (not running, too slow, or the
+model is missing), the answer area shows a one-line explanation and the fix,
+and the window stays usable: ask again once it is fixed.
 
 ---
 
@@ -143,6 +174,7 @@ video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
 mp3_to_json.py        faster-whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
 dashboard.py          Tkinter UI, dot-product retrieval, prompt assembly
+preflight.py          startup checks, settings validation, readable Ollama errors
 tests/                pipeline, dashboard, audio and crash-safety tests
 tests/_pipeline.py    shared loader compiling script definitions in isolation
 requirements.txt      runtime dependencies
