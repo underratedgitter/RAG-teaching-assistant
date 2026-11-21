@@ -12,6 +12,7 @@ import platform
 import json
 import re
 import secrets
+import signal
 import numpy as np
 import pandas as pd
 import requests
@@ -76,6 +77,23 @@ PIPELINE_STEPS = (
     ("mp3_to_json.py", "Transcribing (may take minutes)...", "Transcribing Audio", "transcription"),
     ("preprocess_json.py", "Creating embeddings...", "Creating Embeddings", "embedding creation"),
 )
+# Loading the finished index into memory is the stage after the scripts.
+STAGE_COUNT = len(PIPELINE_STEPS) + 1
+
+# The scripts report "PROGRESS done/total" on a line of their own.
+_PROGRESS_RE = re.compile(r"PROGRESS (\d+)/(\d+)")
+
+# Seconds a cancelled stage gets to stop on SIGTERM before it is killed.
+CANCEL_GRACE_S = 5
+
+# Temp files the scripts write next to their final names and rename into
+# place. Only the project root's own names are swept, never a pattern, so a
+# user's unrelated "*.partial" there is safe.
+ROOT_PARTIAL_FILES = (
+    "chunks.json.partial",
+    "embedding_matrix.npy.partial",
+    "embedding_matrix.meta.json.partial",
+)
 
 # Tkinter is not thread-safe, so worker threads queue their UI updates and
 # the Tk thread applies whatever is pending every UI_POLL_MS.
@@ -113,6 +131,44 @@ def _has_gpu_offload():
 
 
 GENERATION_OPTIONS = {"num_predict": 300}
+
+
+def _parse_progress(line):
+    """(done, total) from a "PROGRESS done/total" line, else None."""
+    match = _PROGRESS_RE.fullmatch(line.strip())
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _stop_process_tree(process, force=False):
+    """Signal a stage and everything it started, such as its ffmpeg workers.
+
+    The stage runs in its own process group (see run_script), so one signal
+    reaches the workers too; stopping only the stage would leave ffmpeg
+    encoding on, with a temp file still open.
+    """
+    if sys.platform.startswith("win"):
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       capture_output=True)
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _wait_for_group_exit(process, timeout):
+    """Whether every process of a stopped stage's group is gone within timeout."""
+    if sys.platform.startswith("win"):
+        return True            # taskkill /T has already ended the tree
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _is_video(name):
@@ -237,6 +293,12 @@ class RAGDashboard:
         # the actions it blocks, and the list is empty until the first check
         # finishes.
         self._problems = []
+        # Cancelling is requested from the Tk thread and acted on by the
+        # worker. The lock makes "is a stage running, and which" one step, so
+        # a cancel cannot fall between a stage being checked and spawned.
+        self._cancel = threading.Event()
+        self._process_lock = threading.Lock()
+        self._current_process = None
         # The only thing a worker thread may do to the UI is put onto this:
         # a str is a terminal line, anything else is called on the Tk thread.
         self._ui_queue = queue.Queue()
@@ -323,6 +385,9 @@ class RAGDashboard:
         tk.Button(btn_frame, text="Upload Videos", command=self.upload_videos).pack(side="left", padx=(0,5))
         self.process_btn = tk.Button(btn_frame, text="Process Videos", command=self.process_videos)
         self.process_btn.pack(side="left", padx=(0,5))
+        self.cancel_btn = tk.Button(btn_frame, text="Cancel", command=self.cancel_processing,
+                                    state="disabled")
+        self.cancel_btn.pack(side="left", padx=(0,5))
         tk.Button(btn_frame, text="Open Folder", command=self.open_videos_folder).pack(side="left", padx=(0,5))
         tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left", padx=(0,5))
         self.recheck_btn = tk.Button(btn_frame, text="Re-check Setup", command=self.recheck_setup)
@@ -647,13 +712,21 @@ class RAGDashboard:
         query no longer recomputes norms for the whole corpus. This also stops
         the per-query `.astype(np.float32)` that copied the entire matrix
         (~30 MB at 10k chunks) every time someone asked something.
+
+        The work happens in place on one float32 buffer. Squaring for the
+        norms and dividing into a new array each held a second full copy of the
+        corpus while loading, which is what a 50k-chunk library (150 MB at 768
+        dimensions) cannot spare twice over.
         """
         if self.embedding_matrix is None:
             return
         m = np.ascontiguousarray(self.embedding_matrix, dtype=np.float32)
-        norms = np.linalg.norm(m, axis=1, keepdims=True)
+        if not m.flags.writeable:
+            m = m.copy()
+        norms = np.sqrt(np.einsum("ij,ij->i", m, m))
         norms[norms == 0] = 1.0          # a zero vector would divide by zero
-        self.embedding_matrix = m / norms
+        m /= norms[:, None]
+        self.embedding_matrix = m
 
     def update_status(self):
         """Update status label with error handling"""
@@ -717,42 +790,128 @@ class RAGDashboard:
             messagebox.showinfo("Busy", "Wait for the current answer to finish.")
             return
 
+        self._cancel.clear()
         self._processing = True
         self._sync_buttons()
         self.clear_terminal()
         threading.Thread(target=self._process, daemon=True).start()
 
-    def run_script(self, script_name, step_name):
-        """Run a script and stream output to terminal"""
+    def run_script(self, script_name, step_name, on_progress=None):
+        """Run a script, stream its output to the terminal and return its exit code.
+
+        PROGRESS lines go to `on_progress(done, total)` instead of the
+        terminal. Returns None when the run was cancelled, with the script and
+        everything it started gone.
+        """
         self.log_safe(f"\n{'='*40}")
         self.log_safe(f"  {step_name}")
         self.log_safe(f"{'='*40}")
 
-        process = subprocess.Popen(
-            # -u: a piped child block-buffers its output, so scripts that do not
-            # flush would show nothing until they exit.
-            [sys.executable, "-u", script_name],
-            cwd=self.base_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",   # a non-UTF-8 byte in tool output must not kill the pipeline thread
-            bufsize=1
-        )
+        with self._process_lock:
+            if self._cancel.is_set():
+                return None
+            process = subprocess.Popen(
+                # -u: a piped child block-buffers its output, so scripts that do not
+                # flush would show nothing until they exit.
+                [sys.executable, "-u", script_name],
+                cwd=self.base_dir,
+                # File names are printed, so both ends agree on UTF-8 rather
+                # than on whatever the console's code page is.
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",   # a non-UTF-8 byte in tool output must not kill the pipeline thread
+                bufsize=1,
+                # Its own process group, so cancelling reaches ffmpeg as well.
+                start_new_session=not sys.platform.startswith("win"),
+            )
+            self._current_process = process
 
-        for line in process.stdout:
-            self.log_safe(line.rstrip())
+        try:
+            for line in process.stdout:
+                text = line.rstrip()
+                progress = _parse_progress(text)
+                if progress is None:
+                    self.log_safe(text)
+                elif on_progress is not None:
+                    on_progress(*progress)
+            process.wait()
+        finally:
+            with self._process_lock:
+                self._current_process = None
+            process.stdout.close()
 
-        process.wait()
+        if self._cancel.is_set():
+            # The stage can be gone while its ffmpeg workers are still
+            # closing their files; the sweep after this must not race them.
+            _wait_for_group_exit(process, CANCEL_GRACE_S + 1)
+            return None
         return process.returncode
+
+    def cancel_processing(self):
+        """Stop the running stage. Tk thread only.
+
+        The worker thread notices the cancelled run, sweeps the temp files and
+        re-enables the buttons. A stage that ignores SIGTERM is killed after
+        CANCEL_GRACE_S.
+        """
+        if not self._processing or self._cancel.is_set():
+            return
+        self._cancel.set()
+        self.log("Cancelling...")
+        self._sync_buttons()
+        with self._process_lock:
+            process = self._current_process
+            if process is not None:
+                _stop_process_tree(process)
+                killer = threading.Timer(CANCEL_GRACE_S, _stop_process_tree, (process, True))
+                killer.daemon = True
+                killer.start()
+
+    def _remove_partial_files(self):
+        """Delete the temp files a stopped stage can leave behind.
+
+        Every output is written to a ".partial" file and renamed when done, so
+        a stage that is killed leaves finished files or temp files, never a
+        truncated finished file. Only the temp files need removing. The
+        stage is gone before this runs, so nothing is still writing them.
+        """
+        paths = [os.path.join(self.base_dir, name) for name in ROOT_PARTIAL_FILES]
+        for folder in (self.audios_dir, self.jsons_dir,
+                       os.path.join(self.base_dir, ".embed_cache")):
+            try:
+                paths.extend(os.path.join(folder, name) for name in os.listdir(folder)
+                             if name.endswith(".partial"))
+            except OSError:
+                continue
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                self.log_safe(f"Could not remove {path}: {e}")
+
+    def _cancelled(self):
+        self._remove_partial_files()
+        self._status("Cancelled")
+        self.log_safe("\n[CANCELLED] Processing stopped. Finished work is kept; the next run resumes from it.")
 
     def _process(self):
         try:
             incomplete = []
-            total = len(PIPELINE_STEPS)
             for n, (script, doing, title, noun) in enumerate(PIPELINE_STEPS, 1):
-                self._status(f"Step {n}/{total}: {doing}")
-                code = self.run_script(script, f"Step {n}/{total}: {title}")
+                self._status(f"Step {n}/{STAGE_COUNT}: {doing}")
+
+                def report(done, total, n=n, doing=doing):
+                    self._status(f"Step {n}/{STAGE_COUNT}: {doing} {done}/{total} files")
+
+                code = self.run_script(script, f"Step {n}/{STAGE_COUNT}: {title}", report)
+                if code is None:
+                    self._cancelled()
+                    return
                 if code == PARTIAL_FAILURE:
                     # One bad lecture must not block the others.
                     incomplete.append(noun)
@@ -760,6 +919,11 @@ class RAGDashboard:
                     self._status(f"Error in {noun}")
                     return
 
+            if self._cancel.is_set():
+                self._cancelled()
+                return
+
+            self._status(f"Step {STAGE_COUNT}/{STAGE_COUNT}: Loading the index...")
             self.load_embeddings()
             chunks = len(self.df) if self.df is not None else 0
             if incomplete:
@@ -787,6 +951,8 @@ class RAGDashboard:
         one while the other operation still needs it locked."""
         busy = self._processing or self._answering
         blocked = preflight.blocked_actions(self._problems)
+        self.cancel_btn.config(
+            state="normal" if self._processing and not self._cancel.is_set() else "disabled")
         self.process_btn.config(
             state="disabled" if busy or preflight.PROCESS in blocked else "normal",
             text="Processing..." if self._processing else "Process Videos",
@@ -845,9 +1011,10 @@ class RAGDashboard:
             sims = matrix @ (q / (qn if qn else 1.0))
 
             # argpartition is O(n); a full argsort was sorting every chunk to
-            # read the top few.
+            # read the top few. Selecting the largest k directly avoids a
+            # negated copy of every score.
             k = min(TOP_K, sims.shape[0])
-            cand = np.argpartition(-sims, k - 1)[:k]
+            cand = np.argpartition(sims, sims.shape[0] - k)[sims.shape[0] - k:]
             cand = cand[np.argsort(-sims[cand])]
 
             top_idx = [int(i) for i in cand if sims[i] > SIMILARITY_THRESHOLD]

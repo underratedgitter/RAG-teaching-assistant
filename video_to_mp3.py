@@ -11,6 +11,9 @@ import time
 import preflight
 
 preflight.require(ffmpeg=True)
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
 
 os.makedirs("audios", exist_ok=True)
 os.makedirs("videos", exist_ok=True)
@@ -293,12 +296,14 @@ start = time.time()
 max_workers = min(4, os.cpu_count() or 2)
 
 failures = []
+jobs = _plan_conversions(files, existing_audios)
+print(f"PROGRESS 0/{len(jobs)}", flush=True)
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    jobs = _plan_conversions(files, existing_audios)
     futures = [executor.submit(convert_video, job) for job in jobs]
-    for future in as_completed(futures):
+    for done, future in enumerate(as_completed(futures), 1):
         ok, message = future.result()
         print(f"  {message}")
+        print(f"PROGRESS {done}/{len(jobs)}", flush=True)
         if not ok:
             failures.append(message)
 

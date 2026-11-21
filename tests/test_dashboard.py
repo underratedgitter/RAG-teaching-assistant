@@ -35,6 +35,7 @@ _FUNCTIONS = {
     "_abort_on_bad_settings",
     "_matrix_matches_dataframe",
     "_is_video",
+    "_parse_progress",
     "_clean_field",
     "_neutralise_tags",
     "_time_parts",
@@ -73,6 +74,7 @@ _CONSTANTS = {
     "VIDEO_EXTENSIONS",
     "GENERATION_OPTIONS",
     "_TAG_RE",
+    "_PROGRESS_RE",
 }
 
 
@@ -397,7 +399,9 @@ def test_script_output_reaches_the_terminal_while_the_script_runs(ns, tmp_path, 
         "    time.sleep(0.05)\n"
     )
     lines = []
-    app = SimpleNamespace(base_dir=str(tmp_path), log_safe=lines.append)
+    app = SimpleNamespace(base_dir=str(tmp_path), log_safe=lines.append,
+                          _cancel=threading.Event(), _process_lock=threading.Lock(),
+                          _current_process=None)
     runner = threading.Thread(target=ns["run_script"], args=(app, "child.py", "Child"))
     runner.start()
     try:
@@ -483,8 +487,10 @@ def _busy_app(ns, processing=False, answering=False):
         status_label=_StubLabel(),
         ask_btn=_StubButton(),
         process_btn=_StubButton(),
+        cancel_btn=_StubButton(),
         df="a corpus",
         _problems=[],
+        _cancel=threading.Event(),
         _processing=processing,
         _answering=answering,
         log=lambda text: None,
@@ -889,6 +895,54 @@ def test_applying_no_problems_hides_the_message_and_unlocks(ns):
     ns["_apply_preflight"](app, [])
     assert app.setup_label.packed is False
     assert app.process_btn.state == "normal" and app.ask_btn.state == "normal"
+
+
+# ── cancel and the startup checks share the buttons ────────────────────────
+
+def test_a_running_stage_can_be_cancelled_whatever_the_checks_found(ns):
+    app = _busy_app(ns, processing=True)
+    app._problems = [_NO_FFMPEG]
+    ns["_sync_buttons"](app)
+    assert app.cancel_btn.state == "normal"
+    assert app.process_btn.state == "disabled"
+    assert app.ask_btn.state == "disabled"
+
+
+def test_a_cancelled_stage_cannot_be_cancelled_again_and_stays_locked(ns):
+    app = _busy_app(ns, processing=True)
+    app._problems = [_NO_FFMPEG]
+    app._cancel.set()
+    ns["_sync_buttons"](app)
+    assert app.cancel_btn.state == "disabled"
+    assert app.process_btn.state == "disabled"
+
+
+def test_finishing_with_a_missing_prerequisite_leaves_only_that_action_locked(ns):
+    app = _busy_app(ns, processing=True)
+    app._problems = [_NO_FFMPEG]
+    ns["_sync_buttons"](app)
+    app._processing = False
+    ns["_sync_buttons"](app)
+    assert (app.cancel_btn.state, app.process_btn.state, app.ask_btn.state) == (
+        "disabled", "disabled", "normal")
+
+
+def test_a_recheck_that_clears_the_problems_does_not_unlock_a_running_stage(ns):
+    app = _setup_app(ns)
+    app._processing = True
+    ns["_apply_preflight"](app, [_NO_FFMPEG])
+    ns["_apply_preflight"](app, [])
+    assert app.process_btn.state == "disabled" and app.ask_btn.state == "disabled"
+    assert app.cancel_btn.state == "normal"
+    assert app.recheck_btn.state == "normal"
+
+
+def test_a_recheck_that_finds_a_problem_mid_run_keeps_cancel_available(ns):
+    app = _setup_app(ns)
+    app._processing = True
+    ns["_apply_preflight"](app, [_NO_OLLAMA])
+    assert app.cancel_btn.state == "normal"
+    assert app.process_btn.state == "disabled" and app.ask_btn.state == "disabled"
 
 
 def _preflight_app(ns, monkeypatch, problems):

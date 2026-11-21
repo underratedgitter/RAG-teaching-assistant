@@ -33,6 +33,8 @@ If the `small` model won't load it degrades to `base`, then `tiny`, and each siz
 
 Embeddings are cached per file under `.embed_cache/`, keyed by a hash of that file's chunk text and the model name. Adding one lecture to a library of twenty re-embeds one lecture, not twenty. Editing a transcript or switching embedding model invalidates only what changed.
 
+Each script also prints `PROGRESS done/total` on a line of its own after every file it handles (converted, skipped or failed), which is what the dashboard's status bar reads. File names of any kind (spaces, quotes, leading dashes, non-ASCII) go through all four stages, and a console that cannot display a name prints it with escapes instead of aborting the stage.
+
 Each script first checks the tools it depends on and exits `1` with a fix if one is missing (see [Startup checks](#startup-checks)). Then it exits `0` when every input succeeded, `2` when some inputs failed but the rest were processed, and `1` when inputs were given but none could be processed (`preprocess_json.py` also exits `1` when there are no transcripts at all). The dashboard carries on past a `2`, so one unreadable lecture does not block the others, and says which stage had failures.
 
 The dashboard also checks model identity before loading saved embeddings. After
@@ -53,6 +55,10 @@ library in the new format (audio and transcripts are reused).
 models get the raw text.
 
 **4. `dashboard.py`** — a Tkinter interface. Your question is embedded, compared against every chunk by cosine similarity, and the top 8 above a 0.3 threshold are passed to `qwen2.5:1.5b` as context. If nothing clears the threshold it falls back to the best 3, so you get a hedged answer rather than silence. Each answer ends with a "Sources:" line naming the lecture and M:SS–M:SS range of the best 3 chunks it was given, built from the retrieval results rather than from the model's text. The terminal shows the similarity scores of the chunks each answer used, which is what to look at when tuning `SIMILARITY_THRESHOLD`. Instructions go in the system prompt, and the excerpts and the question are wrapped in per-request tags and treated as data, so text inside a lecture cannot pose as an instruction.
+
+**Processing from the dashboard.** **Process Videos** runs the three scripts in turn and then loads the index, so the status bar reads `Step N/4: … done/total files`. **Cancel** (enabled only while a run is going) stops the running stage and everything it started, such as the ffmpeg workers, with `SIGTERM` and a kill after 5 seconds, then deletes the `.partial` temp files they left and re-enables the buttons. Because every output is written to a temp file and renamed, a cancelled or killed stage never leaves a truncated file behind; finished work is kept and the next run resumes from it.
+
+The corpus matrix is normalised once, in place, at load (float32, no second copy), so a question is a single matrix–vector product and allocates nothing the size of the corpus. A synthetic 50k-chunk, 768-dimension library (154 MB) loads in about a second and answers in roughly 10 ms.
 
 The model is instructed to answer **only** from the supplied excerpts, which is what keeps it honest about material it hasn't seen.
 
@@ -173,7 +179,7 @@ The trade is quality: `qwen2.5:1.5b` is a small model, and answers are correspon
 video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
 mp3_to_json.py        faster-whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
-dashboard.py          Tkinter UI, dot-product retrieval, prompt assembly
+dashboard.py          Tkinter UI, cancel and progress, dot-product retrieval, prompt assembly
 preflight.py          startup checks, settings validation, readable Ollama errors
 tests/                pipeline, dashboard, audio and crash-safety tests
 tests/_pipeline.py    shared loader compiling script definitions in isolation
@@ -191,5 +197,9 @@ pip install -r requirements-dev.txt && pytest tests/ -q
 Tests covering audio conversion, transcription loop and device fallbacks, PyAV
 compatibility, chunk sizing, timestamp correctness, overlap, content
 preservation, linear scaling, embedding-cache invalidation, parallel batch
-ordering, the crash-safety of every file the pipeline writes, corpus and model
-identity on load, prompt construction, and the dashboard's threading. They need no models and no network.
+ordering, the crash-safety of every file the pipeline writes (including a stage
+killed midway), corpus and model identity on load, prompt construction, the
+dashboard's threading, cancelling a run, progress reporting, a 50k-chunk
+memory bound, and all four stages on awkward file names. They need no models
+and no network: the end-to-end tests use stand-in ffmpeg, Whisper and Ollama
+on 127.0.0.1.
