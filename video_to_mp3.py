@@ -8,6 +8,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
+import preflight
+
+preflight.require(ffmpeg=True)
+
 os.makedirs("audios", exist_ok=True)
 os.makedirs("videos", exist_ok=True)
 
