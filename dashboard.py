@@ -121,6 +121,26 @@ def _time_parts(value):
         return (0, 0)
 
 
+def format_sources(rows, limit=3):
+    """A "Sources:" line for the chunks the answer drew on, best match first.
+
+    Built from the retrieved rows, not from the model's text: a small model
+    does not reliably write the timestamps it was given.
+    """
+    seen = []
+    for row in rows:
+        mins_s, secs_s = _time_parts(row.get("start"))
+        mins_e, secs_e = _time_parts(row.get("end"))
+        source = (
+            f'Video {_clean_field(row.get("number", ""))} '
+            f'({_clean_field(row.get("title", ""))}) '
+            f"{mins_s}:{secs_s:02d}\u2013{mins_e}:{secs_e:02d}"
+        )
+        if source not in seen:
+            seen.append(source)
+    return "Sources: " + "; ".join(seen[:limit])
+
+
 def build_prompt(rows, question, tag):
     """Build the user prompt: tagged excerpts, then the tagged question.
 
@@ -775,7 +795,8 @@ class RAGDashboard:
             # The tag is random per request, so the system prompt cannot know
             # it in advance and pasted content cannot close its own block.
             tag = secrets.token_hex(8)
-            prompt = build_prompt(chunks.to_dict("records"), question, tag)
+            rows = chunks.to_dict("records")
+            prompt = build_prompt(rows, question, tag)
 
             r = session.post(f"{OLLAMA_URL}/api/generate",
                 json={
@@ -787,7 +808,7 @@ class RAGDashboard:
                 },
                 timeout=120)
             r.raise_for_status()
-            response = r.json()["response"]
+            response = f'{r.json()["response"]}\n\n{format_sources(rows)}'
 
             self.log_safe("Done!")
             self._ui_queue.put(lambda: self._show_response(response))

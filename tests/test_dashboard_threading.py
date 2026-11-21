@@ -22,7 +22,9 @@ DASHBOARD = Path(__file__).parents[1] / "dashboard.py"
 _POLLER = "_drain_ui_queue"
 _POLL_STOPPER = "_stop_polling"
 
-_FUNCTIONS = {"_clean_field", "_neutralise_tags", "_time_parts", "build_prompt"}
+_FUNCTIONS = {
+    "_clean_field", "_neutralise_tags", "_time_parts", "build_prompt", "format_sources",
+}
 _METHODS = {
     "log",
     "log_safe",
@@ -392,7 +394,9 @@ def test_an_answer_thread_only_queues_its_result():
     assert app.root.scheduled == []
 
     app._drain_ui_queue()
-    assert events[-1] == ("response", "an answer")
+    assert events[-1] == (
+        "response", "an answer\n\nSources: Video 1 (Intro) 0:00\u20130:30",
+    )
     assert events[-2][0] == "insert" and events[-2][1].endswith("Done!\n")
 
 

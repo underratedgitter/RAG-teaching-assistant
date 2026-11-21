@@ -52,7 +52,7 @@ library in the new format (audio and transcripts are reused).
 `search_document: …` and questions as `search_query: …`. Other embedding
 models get the raw text.
 
-**4. `dashboard.py`** — a Tkinter interface. Your question is embedded, compared against every chunk by cosine similarity, and the top 8 above a 0.3 threshold are passed to `qwen2.5:1.5b` as context. If nothing clears the threshold it falls back to the best 3, so you get a hedged answer rather than silence. The terminal shows the similarity scores of the chunks each answer used, which is what to look at when tuning `SIMILARITY_THRESHOLD`. Instructions go in the system prompt, and the excerpts and the question are wrapped in per-request tags and treated as data, so text inside a lecture cannot pose as an instruction.
+**4. `dashboard.py`** — a Tkinter interface. Your question is embedded, compared against every chunk by cosine similarity, and the top 8 above a 0.3 threshold are passed to `qwen2.5:1.5b` as context. If nothing clears the threshold it falls back to the best 3, so you get a hedged answer rather than silence. Each answer ends with a "Sources:" line naming the lecture and M:SS–M:SS range of the best 3 chunks it was given, built from the retrieval results rather than from the model's text. The terminal shows the similarity scores of the chunks each answer used, which is what to look at when tuning `SIMILARITY_THRESHOLD`. Instructions go in the system prompt, and the excerpts and the question are wrapped in per-request tags and treated as data, so text inside a lecture cannot pose as an instruction.
 
 The model is instructed to answer **only** from the supplied excerpts, which is what keeps it honest about material it hasn't seen.
 

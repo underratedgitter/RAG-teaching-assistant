@@ -36,6 +36,7 @@ _FUNCTIONS = {
     "_neutralise_tags",
     "_time_parts",
     "build_prompt",
+    "format_sources",
 }
 _METHODS = {
     "load_embeddings",
@@ -690,6 +691,83 @@ def test_the_fallback_is_logged_with_its_scores(ns):
     assert any(line == "No chunk above 0.30 — using best 3 "
                        "(similarity 0.22, 0.19, 0.18)"
                for line in logs)
+
+
+def _shown(app):
+    """The text the user would see, as queued for the UI thread."""
+    shown = []
+    app._show_response = shown.append
+    while not app._ui_queue.empty():
+        app._ui_queue.get()()
+    return shown[-1]
+
+
+def test_the_answer_is_followed_by_a_sources_line(ns):
+    df, matrix = _corpus([0.9, 0.8])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _shown(app) == (
+        "an answer\n\n"
+        "Sources: Video 1 (Lecture 1) 0:00\u20130:30; Video 2 (Lecture 2) 1:00\u20131:30"
+    )
+
+
+def test_the_sources_are_the_top_three_chunks_by_similarity(ns):
+    df, matrix = _corpus([0.5, 0.9, 0.7, 0.6, 0.8])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    sources = _shown(app).split("Sources: ")[1]
+    assert sources == (
+        "Video 2 (Lecture 2) 1:00\u20131:30; "
+        "Video 5 (Lecture 5) 4:00\u20134:30; "
+        "Video 3 (Lecture 3) 2:00\u20132:30"
+    )
+
+
+def test_a_repeated_chunk_location_is_listed_once(ns):
+    df, matrix = _corpus([0.9, 0.8])
+    df.loc[1, ["number", "title", "start", "end"]] = [1, "Lecture 1", 0, 30]
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _shown(app).endswith("Sources: Video 1 (Lecture 1) 0:00\u20130:30")
+
+
+def test_the_fallback_chunks_are_listed_as_sources(ns):
+    df, matrix = _corpus([0.22, 0.19, 0.18, 0.10])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    sources = _shown(app).split("Sources: ")[1]
+    assert sources.count(";") == 2
+    assert "Video 4" not in sources
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_a_non_finite_timestamp_shows_zero_in_the_sources(ns, bad):
+    df, matrix = _corpus([0.9])
+    df["start"] = df["start"].astype(float)
+    df.loc[0, "start"] = bad
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _shown(app).endswith("Sources: Video 1 (Lecture 1) 0:00\u20130:30")
+
+
+def test_the_model_prompt_does_not_ask_for_the_sources_line(ns):
+    df, matrix = _corpus([0.9])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert "Sources:" not in _request(session, "/api/generate")["json"]["prompt"]
 
 
 def test_the_search_line_reports_the_top_k(ns):
