@@ -32,6 +32,7 @@ LEGACY_ARTIFACT = "embeddings.joblib"
 _FUNCTIONS = {
     "_matrix_matches_dataframe",
     "_is_video",
+    "_parse_progress",
     "_clean_field",
     "_neutralise_tags",
     "_time_parts",
@@ -64,6 +65,7 @@ _CONSTANTS = {
     "VIDEO_EXTENSIONS",
     "GENERATION_OPTIONS",
     "_TAG_RE",
+    "_PROGRESS_RE",
 }
 
 
@@ -387,7 +389,9 @@ def test_script_output_reaches_the_terminal_while_the_script_runs(ns, tmp_path, 
         "    time.sleep(0.05)\n"
     )
     lines = []
-    app = SimpleNamespace(base_dir=str(tmp_path), log_safe=lines.append)
+    app = SimpleNamespace(base_dir=str(tmp_path), log_safe=lines.append,
+                          _cancel=threading.Event(), _process_lock=threading.Lock(),
+                          _current_process=None)
     runner = threading.Thread(target=ns["run_script"], args=(app, "child.py", "Child"))
     runner.start()
     try:
@@ -473,7 +477,9 @@ def _busy_app(ns, processing=False, answering=False):
         status_label=_StubLabel(),
         ask_btn=_StubButton(),
         process_btn=_StubButton(),
+        cancel_btn=_StubButton(),
         df="a corpus",
+        _cancel=threading.Event(),
         _processing=processing,
         _answering=answering,
         log=lambda text: None,
