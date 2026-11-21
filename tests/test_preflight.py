@@ -1,7 +1,10 @@
 """Startup checks: what is reported, what it blocks, and what the scripts do about it."""
+import json
 import os
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -354,3 +357,237 @@ def test_a_script_reports_a_bad_setting_instead_of_a_traceback(tmp_path):
     assert done.returncode == 1
     assert "EMBED_CONCURRENCY='lots' must be a whole number" in done.stderr
     assert "Traceback" not in done.stderr
+
+
+# ── python preflight.py: the launcher's entry point ─────────────────────────
+#
+# These run main() against a throwaway Ollama bound to 127.0.0.1 and a PATH the
+# test controls. Nothing here needs Ollama, ffmpeg or the network.
+
+@pytest.fixture
+def fake_ollama():
+    """A fake Ollama whose installed models the test chooses."""
+    installed = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/api/tags":
+                self.send_error(404)
+                return
+            body = json.dumps({"models": [{"name": n} for n in installed]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_port}", installed
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture
+def tools(tmp_path, monkeypatch):
+    """A PATH holding only the fake executables a test installs.
+
+    faster-whisper is reported as importable: these tests are about ffmpeg,
+    Ollama and the pulls, and the real import is slow.
+    """
+    monkeypatch.setenv("PATH", str(tmp_path))
+    for var in ("OLLAMA_URL", "EMBED_MODEL", "ANSWER_MODEL", "RAG_AUTO_PULL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(preflight, "check_whisper", lambda isolated=False: [])
+
+    def install(name, script="exit 0"):
+        path = tmp_path / name
+        path.write_text(f"#!/bin/sh\n{script}\n")
+        path.chmod(0o755)
+        return path
+
+    return install
+
+
+def test_everything_present_passes(fake_ollama, tools, monkeypatch, capsys):
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text:latest", "qwen2.5:1.5b"]
+    tools("ffmpeg")
+    monkeypatch.setenv("OLLAMA_URL", url)
+
+    assert preflight.main() == 0
+    assert "missing" not in capsys.readouterr().out
+
+
+def test_missing_model_is_named_with_its_pull_command(fake_ollama, tools, monkeypatch, capsys):
+    url, installed = fake_ollama
+    installed.append("nomic-embed-text:latest")
+    tools("ffmpeg")
+    monkeypatch.setenv("OLLAMA_URL", url)
+
+    assert preflight.main() == 1
+    assert "ollama pull qwen2.5:1.5b" in capsys.readouterr().out
+
+
+def test_configured_models_are_the_ones_checked(fake_ollama, tools, monkeypatch, capsys):
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text:latest", "qwen2.5:1.5b"]
+    tools("ffmpeg")
+    monkeypatch.setenv("OLLAMA_URL", url)
+    monkeypatch.setenv("ANSWER_MODEL", "llama3.2:3b")
+
+    assert preflight.main() == 1
+    assert "ollama pull llama3.2:3b" in capsys.readouterr().out
+
+
+def test_missing_ffmpeg_gets_an_install_hint(fake_ollama, tools, monkeypatch, capsys):
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text", "qwen2.5:1.5b"]
+    monkeypatch.setenv("OLLAMA_URL", url)
+
+    assert preflight.main() == 1
+    assert "ffmpeg" in capsys.readouterr().out.lower()
+
+
+def test_unreachable_ollama_lists_the_pulls_instead_of_guessing(tools, monkeypatch, capsys):
+    tools("ffmpeg")
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:1")
+
+    assert preflight.main() == 1
+    out = capsys.readouterr().out
+    assert "ollama pull nomic-embed-text" in out
+    assert "ollama pull qwen2.5:1.5b" in out
+
+
+def test_auto_pull_pulls_each_missing_model(fake_ollama, tools, monkeypatch, tmp_path):
+    url, installed = fake_ollama
+    installed.append("nomic-embed-text:latest")
+    tools("ffmpeg")
+    tools("ollama", f'echo "$@" >> {tmp_path}/pulls')
+    monkeypatch.setenv("OLLAMA_URL", url)
+    monkeypatch.setenv("RAG_AUTO_PULL", "1")
+
+    preflight.main()
+
+    assert (tmp_path / "pulls").read_text().split("\n")[:-1] == ["pull qwen2.5:1.5b"]
+
+
+def test_without_auto_pull_or_a_terminal_nothing_is_pulled(fake_ollama, tools, monkeypatch, tmp_path):
+    url, _ = fake_ollama
+    tools("ffmpeg")
+    tools("ollama", f'echo "$@" >> {tmp_path}/pulls')
+    monkeypatch.setenv("OLLAMA_URL", url)
+
+    assert preflight.main() == 1
+    assert not (tmp_path / "pulls").exists()
+
+
+def test_a_failed_pull_leaves_the_model_reported_missing(fake_ollama, tools, monkeypatch):
+    url, installed = fake_ollama
+    installed.append("nomic-embed-text:latest")
+    tools("ffmpeg")
+    tools("ollama", "exit 1")
+    monkeypatch.setenv("OLLAMA_URL", url)
+    monkeypatch.setenv("RAG_AUTO_PULL", "1")
+
+    assert preflight.main() == 1
+
+
+@pytest.mark.parametrize("requested, installed, present", [
+    ("nomic-embed-text", ["nomic-embed-text:latest"], True),
+    ("qwen2.5:1.5b", ["qwen2.5:1.5b"], True),
+    ("qwen2.5:1.5b", ["qwen2.5:7b"], False),
+    ("qwen2.5", ["qwen2.5:7b"], False),
+])
+def test_model_matching_follows_ollama_tags(monkeypatch, requested, installed, present):
+    _ollama(monkeypatch, _tags(*installed))
+    problems = preflight.check_ollama("http://x", requested)
+    assert (problems == []) is present
+    assert present or problems[0].model == requested
+
+
+def test_the_command_line_pulls_only_what_a_check_says_is_pullable(
+    fake_ollama, tools, monkeypatch, tmp_path
+):
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text:latest", "qwen2.5:1.5b"]
+    tools("ffmpeg")
+    tools("ollama", f'echo "$@" >> {tmp_path}/pulls')
+    monkeypatch.setenv("OLLAMA_URL", url)
+    monkeypatch.setenv("RAG_AUTO_PULL", "1")
+
+    assert preflight.main() == 0
+    assert not (tmp_path / "pulls").exists()
+
+
+def test_a_pull_that_works_makes_the_next_check_pass(fake_ollama, tools, monkeypatch, capsys):
+    url, installed = fake_ollama
+    installed.append("nomic-embed-text:latest")
+    tools("ffmpeg")
+    tools("ollama", "true")
+    monkeypatch.setenv("OLLAMA_URL", url)
+    monkeypatch.setenv("RAG_AUTO_PULL", "1")
+    monkeypatch.setattr(preflight, "_pull", lambda models, u: installed.extend(models))
+
+    assert preflight.main() == 0
+    assert "missing" not in capsys.readouterr().out
+
+
+def test_the_command_line_checks_faster_whisper_in_a_child_process(
+    fake_ollama, tools, monkeypatch, capsys
+):
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text:latest", "qwen2.5:1.5b"]
+    tools("ffmpeg")
+    monkeypatch.setenv("OLLAMA_URL", url)
+    asked = []
+    problem = preflight.Problem("faster-whisper", "faster-whisper could not be imported (x).",
+                                "pip install -r requirements.txt", (PROCESS,))
+    monkeypatch.setattr(preflight, "check_whisper",
+                        lambda isolated=False: asked.append(isolated) or [problem])
+
+    assert preflight.main() == 1
+    assert asked == [True]
+    assert "pip install -r requirements.txt" in capsys.readouterr().out
+
+
+def test_the_command_line_reports_a_bad_setting_by_name(tools, monkeypatch, capsys):
+    monkeypatch.setenv("TOP_K", "many")
+    assert preflight.main() == 1
+    assert "TOP_K" in capsys.readouterr().out
+
+
+def test_ollama_is_checked_without_requests_installed(fake_ollama, monkeypatch):
+    url, installed = fake_ollama
+    installed.append("nomic-embed-text:latest")
+    monkeypatch.setattr(preflight, "requests", None)
+
+    assert preflight.check_ollama(url, "nomic-embed-text") == []
+    [problem] = preflight.check_ollama(url, "nomic-embed-text", "qwen2.5:1.5b")
+    assert problem.model == "qwen2.5:1.5b"
+    [problem] = preflight.check_ollama("http://127.0.0.1:1", "nomic-embed-text")
+    assert problem.fix == "ollama serve"
+
+
+def test_the_script_runs_with_only_the_standard_library(fake_ollama, tmp_path):
+    """The launcher runs it before requirements are installed."""
+    url, installed = fake_ollama
+    installed += ["nomic-embed-text:latest", "qwen2.5:1.5b"]
+    ffmpeg = tmp_path / "ffmpeg"
+    ffmpeg.write_text("#!/bin/sh\nexit 0\n")
+    ffmpeg.chmod(0o755)
+    blocked = (
+        "import sys, runpy\n"
+        "sys.modules['requests'] = None\n"
+        "sys.modules['faster_whisper'] = None\n"
+        f"sys.exit(runpy.run_path({str(ROOT / 'preflight.py')!r}, run_name='__main__') or 0)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", blocked], capture_output=True, text=True, timeout=120,
+        env={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}", "OLLAMA_URL": url},
+    )
+    assert "Traceback" not in done.stderr, done.stderr
+    assert "ok       model nomic-embed-text" in done.stdout
+    assert "ok       model qwen2.5:1.5b" in done.stdout

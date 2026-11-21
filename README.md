@@ -8,6 +8,24 @@ Transcription is the slow stage, so it runs on [faster-whisper](https://github.c
 
 ---
 
+## Quickstart
+
+From a fresh clone, one command:
+
+```bash
+./scripts/start.sh        # or: make start    (macOS: double-click start.command)
+```
+
+It creates `.venv` (with [uv](https://docs.astral.sh/uv/) if you have it, otherwise `python3 -m venv`), installs `requirements.txt`, checks that ffmpeg, faster-whisper, Ollama and both models are in place (the [startup checks](#startup-checks)), and opens the dashboard. When something is missing it prints the exact command that fixes it (`brew install ffmpeg`, `ollama pull qwen2.5:1.5b`) and, on an interactive terminal, offers to pull the missing models. It never pulls without a yes or `RAG_AUTO_PULL=1`. A missing piece does not stop the dashboard opening: you can still ask questions of an already-processed library without ffmpeg.
+
+Running it again is quick: dependencies are reinstalled only when `requirements.txt` changes, so a second launch is the preflight and the window, about a second. `make check` (or `.venv/bin/python preflight.py`) runs the checks alone.
+
+The launcher needs bash, so on Windows follow the manual steps under [Requirements](#requirements). It needs Python 3.11–3.14 with Tk. If the dashboard will not import, install your Python's Tk package (`brew install python-tk`, `sudo apt install python3-tk`). Intel Macs have no `onnxruntime` wheel for Python 3.14, so use 3.11–3.13 there; with uv installed the launcher fetches a suitable Python itself.
+
+For CI or a headless smoke test, `RAG_NO_GUI=1 ./scripts/start.sh` does the same setup and checks, confirms `dashboard.py` imports, and exits without opening the window.
+
+---
+
 ## How it works
 
 Four stages, each a script you can run on its own.
@@ -87,6 +105,8 @@ missing, the loader falls back through `int8_float16` and `float32` and, in
 the worst case, the CPU. Override anything with `WHISPER_MODEL=small` if you
 would rather wait for the accuracy.
 
+To set up by hand instead of using the [Quickstart](#quickstart) launcher:
+
 ```bash
 pip install -r requirements.txt
 
@@ -115,6 +135,8 @@ before anything runs (see [Startup checks](#startup-checks)):
 | `SIMILARITY_THRESHOLD` | `0.3` | number, -1 to 1 | cosine similarity below which a chunk is treated as unrelated |
 | `TOP_K` | `8` | whole number, 1-100 | chunks passed to the model as context |
 | `FALLBACK_K` | `3` | whole number, 1-100 | chunks used when nothing clears the threshold |
+| `RAG_NO_GUI` | unset | `0`, `1` | `1` makes `scripts/start.sh` set up and check everything, then exit without opening the window |
+| `RAG_AUTO_PULL` | unset | `0`, `1` | `1` lets `preflight.py` (and so the launcher) pull missing Ollama models without asking |
 | `CLEAR_ON_START` | unset | `0`, `1` | `1` wipes the derived work (audio, transcripts, embeddings) on launch, for a clean demo; `videos/` is kept |
 
 ### Startup checks
@@ -135,6 +157,8 @@ Problems appear in red under the buttons and in the terminal pane (and on the
 launching terminal), and only the buttons that need the missing piece are
 disabled. Fix the problem, then click **Re-check Setup**; no restart is needed.
 A script run on its own prints the same message to stderr and exits `1`.
+
+`python preflight.py` runs the same checks from the command line, which is what the launcher and `make check` call. It needs only the Python standard library, so it works before requirements are installed. It prints one line per piece, the fix for each gap, and exits `0` when everything is ready and `1` otherwise. When a model is missing and the `ollama` CLI is there, it offers to pull it (a yes at the prompt on a terminal, or `RAG_AUTO_PULL=1`); it never pulls unasked.
 
 An invalid setting is reported by name and the reason (for example
 `TOP_K='many' must be a whole number`) before anything starts; the dashboard
@@ -180,7 +204,10 @@ video_to_mp3.py       ffmpeg extraction, thread-pooled, resumable, atomic
 mp3_to_json.py        faster-whisper transcription with timestamps, model ladder
 preprocess_json.py    segment merging, batched embeddings, retry logic
 dashboard.py          Tkinter UI, cancel and progress, dot-product retrieval, prompt assembly
-preflight.py          startup checks, settings validation, readable Ollama errors
+preflight.py          startup checks, settings validation, readable Ollama errors, the `python preflight.py` check
+scripts/start.sh      one-command launcher: .venv, requirements, preflight, dashboard
+start.command         macOS double-click wrapper for scripts/start.sh
+Makefile              make start / make check
 tests/                pipeline, dashboard, audio and crash-safety tests
 tests/_pipeline.py    shared loader compiling script definitions in isolation
 requirements.txt      runtime dependencies

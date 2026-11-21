@@ -1,21 +1,35 @@
-"""Startup checks and settings validation, shared by the dashboard and the scripts.
+"""Startup checks and settings validation, shared by the dashboard, the scripts
+and the launcher.
 
 Everything the pipeline needs from outside Python (ffmpeg, Ollama and its
 models, faster-whisper) is checked here, and each missing piece becomes a
 Problem that says what is wrong, the exact command that fixes it, and which
 actions cannot work until it is fixed. A check never raises: a missing tool
 is an expected state on a fresh machine, not an error in the program.
+
+Run as `python preflight.py` it prints one line per piece with the fix for each
+gap, offers to pull missing Ollama models (RAG_AUTO_PULL=1, or a yes at the
+prompt on a terminal) and exits 0 when everything is ready, 1 otherwise. That
+entry point needs only the standard library, so the launcher can run it before
+requirements are installed: requests is optional, and faster-whisper is only
+ever imported in a child process.
 """
 import importlib
+import json
 import math
 import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-import requests
+try:
+    import requests
+except ImportError:     # the launcher runs this file before requirements are installed
+    requests = None
 
 # The two things a user can do in the dashboard. A Problem lists the ones it
 # blocks, so only those are disabled.
@@ -47,6 +61,8 @@ class Problem:
     message: str
     fix: str
     blocks: tuple[str, ...]
+    # The Ollama model that `ollama pull` would supply, when that is the fix.
+    model: str | None = None
 
 
 # ── settings ────────────────────────────────────────────────────────────────
@@ -126,6 +142,8 @@ SETTINGS = (
     ("WHISPER_VAD", _choice("0", "1"), False),
     ("WHISPER_CPU_THREADS", _integer(0, 512), False),
     ("CLEAR_ON_START", _choice("0", "1"), True),
+    ("RAG_NO_GUI", _choice("0", "1"), True),
+    ("RAG_AUTO_PULL", _choice("0", "1"), True),
 )
 
 
@@ -191,20 +209,46 @@ def _is_installed(model, installed):
     return model in installed or (":" not in model and f"{model}:latest" in installed)
 
 
+def _get_tags(url):
+    """Ollama's model list, as the decoded JSON.
+
+    Uses requests when it is installed and the standard library when it is
+    not. Either way an unreachable host raises ConnectionError or Timeout
+    (requests' or the builtin ones) and a bad reply raises ValueError.
+    """
+    endpoint = f"{url.rstrip('/')}/api/tags"
+    if requests is not None:
+        reply = requests.get(endpoint, timeout=CHECK_TIMEOUT)
+        reply.raise_for_status()
+        return reply.json()
+    try:
+        with urllib.request.urlopen(endpoint, timeout=CHECK_TIMEOUT) as reply:
+            return json.load(reply)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise ConnectionError(str(exc.reason)) from exc
+
+
+# What "nobody is listening" looks like, from either HTTP client.
+_UNREACHABLE = (ConnectionError, TimeoutError) + (
+    (requests.ConnectionError, requests.Timeout) if requests is not None else ())
+_BAD_REPLY = (ValueError, KeyError, TypeError, AttributeError) + (
+    (requests.RequestException,) if requests is not None else ())
+
+
 def check_ollama(url, embed_model, answer_model=None):
     """Whether Ollama answers at `url` and has the models that were asked for."""
     try:
-        reply = requests.get(f"{url.rstrip('/')}/api/tags", timeout=CHECK_TIMEOUT)
-        reply.raise_for_status()
         installed = {
-            entry.get("name") or entry.get("model") for entry in reply.json()["models"]
+            entry.get("name") or entry.get("model") for entry in _get_tags(url)["models"]
         }
-    except (requests.ConnectionError, requests.Timeout):
+    except _UNREACHABLE:
         return [Problem(
             "ollama", f"Ollama is not reachable at {url}. Is it running, and is OLLAMA_URL right?",
             "ollama serve", (PROCESS, ASK),
         )]
-    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as exc:
+    except _BAD_REPLY as exc:
         return [Problem(
             "ollama", f"{url} did not return an Ollama model list ({exc}).",
             f"curl {url.rstrip('/')}/api/tags", (PROCESS, ASK),
@@ -214,12 +258,12 @@ def check_ollama(url, embed_model, answer_model=None):
     if not _is_installed(embed_model, installed):
         problems.append(Problem(
             f"model {embed_model}", f"The embedding model {embed_model} is not pulled.",
-            f"ollama pull {embed_model}", (PROCESS, ASK),
+            f"ollama pull {embed_model}", (PROCESS, ASK), embed_model,
         ))
     if answer_model and not _is_installed(answer_model, installed):
         problems.append(Problem(
             f"model {answer_model}", f"The answer model {answer_model} is not pulled.",
-            f"ollama pull {answer_model}", (ASK,),
+            f"ollama pull {answer_model}", (ASK,), answer_model,
         ))
     return problems
 
@@ -296,3 +340,62 @@ def _ollama_error_text(response):
     except (AttributeError, ValueError):
         return ""
     return text if isinstance(text, str) else ""
+
+
+# ── command line ────────────────────────────────────────────────────────────
+
+def _wants_pull():
+    if os.environ.get("RAG_AUTO_PULL") == "1":
+        return True
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    return input("Pull the missing models now? [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+def _pull(models, url):
+    """Pull each model with the ollama CLI; one that fails stays reported as missing."""
+    env = {**os.environ, "OLLAMA_HOST": url}
+    for model in models:
+        subprocess.run(["ollama", "pull", model], env=env)
+
+
+def main():
+    """Print what is ready and what is not, offer to pull models, return the exit code."""
+    errors = check_config()
+    if errors:
+        for error in errors:
+            print(f"invalid  {error}")
+        return 1
+
+    url = os.environ.get("OLLAMA_URL", DEFAULTS["OLLAMA_URL"])
+    embed_model = os.environ.get("EMBED_MODEL", DEFAULTS["EMBED_MODEL"])
+    answer_model = os.environ.get("ANSWER_MODEL", DEFAULTS["ANSWER_MODEL"])
+    models = list(dict.fromkeys([embed_model, answer_model]))
+    have_ollama_cli = shutil.which("ollama") is not None
+
+    local = check_ffmpeg() + check_whisper(isolated=True)
+    remote = check_ollama(url, embed_model, answer_model)
+    pullable = [problem.model for problem in remote if problem.model]
+    if pullable and have_ollama_cli and _wants_pull():
+        _pull(pullable, url)
+        remote = check_ollama(url, embed_model, answer_model)
+
+    problems = local + remote
+    by_piece = {problem.piece: problem for problem in problems}
+    for piece in ["ffmpeg", "faster-whisper", "ollama"] + [f"model {m}" for m in models]:
+        problem = by_piece.get(piece)
+        if problem is None:
+            print(f"ok       {'Ollama at ' + url if piece == 'ollama' else piece}")
+            continue
+        print(f"missing  {problem.message}\n         Fix: {problem.fix}")
+        if piece == "ollama":
+            print("         the dashboard will try to start it" if have_ollama_cli
+                  else "         install it from https://ollama.com/download")
+            for model in models:
+                print(f"         then: ollama pull {model}")
+            break
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
