@@ -10,10 +10,12 @@ import ast
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -41,18 +43,23 @@ ODD_NAMES = [
 ]
 
 FAKE_FFMPEG = """#!{python}
-import sys
+import os, sys, time
 args = sys.argv[1:]
 source = args[args.index("-i") + 1]
 with open(source, "rb") as handle:
     handle.read(1)
 with open(args[-1], "wb") as out:
     out.write(b"mp3 of " + source.encode("utf-8", "surrogateescape"))
+    out.flush()
+    if os.environ.get("FAKE_HANG"):
+        open("hung.flag", "w").close()
+        time.sleep(120)
 """
 
 FAKE_CTRANSLATE2 = "def get_cuda_device_count():\n    return 0\n"
 
 FAKE_WHISPER = """import os
+import time
 from types import SimpleNamespace
 
 
@@ -61,6 +68,9 @@ class WhisperModel:
         pass
 
     def transcribe(self, path, **kwargs):
+        if os.environ.get("FAKE_HANG"):
+            open("hung.flag", "w").close()
+            time.sleep(120)
         base = os.path.basename(path)
         segments = [
             SimpleNamespace(start=i * 5.0, end=i * 5.0 + 5.0,
@@ -72,8 +82,16 @@ class WhisperModel:
 
 
 class _FakeOllama(BaseHTTPRequestHandler):
+    hang = threading.Event()      # set: hold every request until released
+    seen = threading.Event()
+    release = threading.Event()
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.hang.is_set():
+            self.seen.set()
+            self.release.wait(120)
+            return
         vectors = [
             [float(b) + 1.0 for b in text.encode("utf-8")[:6].ljust(6, b"\x01")]
             for text in body["input"]
@@ -119,9 +137,12 @@ def workspace(tmp_path):
         # A console that cannot print the file names: the stages must still run.
         PYTHONIOENCODING="ascii",
     )
+    for event in (_FakeOllama.hang, _FakeOllama.seen, _FakeOllama.release):
+        event.clear()
     try:
         yield SimpleNamespace(root=work, env=env)
     finally:
+        _FakeOllama.release.set()
         server.shutdown()
         server.server_close()
 
@@ -133,6 +154,30 @@ def _run(workspace, script):
         capture_output=True, text=True, encoding="ascii", errors="replace",
         timeout=120,
     )
+
+
+def _wait_for(condition, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _kill_midway(workspace, script, hung):
+    """Start a stage, wait until it is stuck inside its work, then SIGKILL it."""
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / script)],
+        cwd=workspace.root, env={**workspace.env, "FAKE_HANG": "1"},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        assert _wait_for(hung), f"{script} never reached its work"
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=10)
 
 
 def _progress(output):
@@ -216,3 +261,38 @@ def test_a_failed_file_still_counts_as_handled(workspace):
 
     assert transcribed.returncode == 2, transcribed.stdout
     assert _progress(transcribed.stdout) == [(0, 2), (1, 2), (2, 2)]
+
+
+@pytest.mark.parametrize("stage", ["video_to_mp3.py", "mp3_to_json.py", "preprocess_json.py"])
+def test_a_stage_killed_midway_leaves_nothing_a_rerun_would_trust(workspace, stage):
+    """Outputs are written to temp files and renamed, so a kill cannot leave a
+    truncated file under a final name for the next run to skip."""
+    root = workspace.root
+    (root / "videos" / "first lecture.mp4").write_bytes(b"recording")
+    stages = ["video_to_mp3.py", "mp3_to_json.py", "preprocess_json.py"]
+    for earlier in stages[: stages.index(stage)]:
+        assert _run(workspace, earlier).returncode == 0
+
+    def finished():
+        """Final-named outputs of the stage under test."""
+        if stage == "video_to_mp3.py":
+            return sorted(p.name for p in (root / "audios").glob("*.mp3"))
+        if stage == "mp3_to_json.py":
+            return sorted(p.name for p in (root / "jsons").glob("*.json"))
+        return sorted(p.name for p in root.glob("chunks.json")) + sorted(
+            p.name for p in root.glob("embedding_matrix.*"))
+
+    if stage == "preprocess_json.py":
+        _FakeOllama.hang.set()
+        stuck = _FakeOllama.seen.is_set
+    else:
+        stuck = (root / "hung.flag").exists
+
+    _kill_midway(workspace, stage, stuck)
+
+    assert finished() == [], f"{stage} left a finished-looking output after being killed"
+
+    _FakeOllama.hang.clear()
+    rerun = _run(workspace, stage)
+    assert rerun.returncode == 0, rerun.stdout
+    assert finished() != []
