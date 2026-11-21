@@ -16,6 +16,8 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
+import preflight
+
 DASHBOARD = Path(__file__).parents[1] / "dashboard.py"
 
 # The only methods allowed to call self.root.after*: both run on the Tk thread.
@@ -39,6 +41,7 @@ _CONSTANTS = {
     "TOP_K",
     "SIMILARITY_THRESHOLD",
     "FALLBACK_K",
+    "OLLAMA_TIMEOUT",
     "OLLAMA_URL",
     "EMBED_MODEL",
     "ANSWER_MODEL",
@@ -75,6 +78,7 @@ def _namespace():
         "secrets": secrets,
         "np": np,
         "requests": requests,
+        "preflight": preflight,
         "HTTPAdapter": HTTPAdapter,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(DASHBOARD), "exec"), ns)
