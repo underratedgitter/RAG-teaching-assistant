@@ -641,13 +641,21 @@ class RAGDashboard:
         query no longer recomputes norms for the whole corpus. This also stops
         the per-query `.astype(np.float32)` that copied the entire matrix
         (~30 MB at 10k chunks) every time someone asked something.
+
+        The work happens in place on one float32 buffer. Squaring for the
+        norms and dividing into a new array each held a second full copy of the
+        corpus while loading, which is what a 50k-chunk library (150 MB at 768
+        dimensions) cannot spare twice over.
         """
         if self.embedding_matrix is None:
             return
         m = np.ascontiguousarray(self.embedding_matrix, dtype=np.float32)
-        norms = np.linalg.norm(m, axis=1, keepdims=True)
+        if not m.flags.writeable:
+            m = m.copy()
+        norms = np.sqrt(np.einsum("ij,ij->i", m, m))
         norms[norms == 0] = 1.0          # a zero vector would divide by zero
-        self.embedding_matrix = m / norms
+        m /= norms[:, None]
+        self.embedding_matrix = m
 
     def update_status(self):
         """Update status label with error handling"""
