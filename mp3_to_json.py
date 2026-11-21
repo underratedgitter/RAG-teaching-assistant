@@ -6,6 +6,10 @@ import time
 import ctranslate2
 from faster_whisper import WhisperModel
 
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 # Setup for performance and reliability
 os.makedirs("audios", exist_ok=True)
 os.makedirs("jsons", exist_ok=True)
@@ -213,12 +217,14 @@ if pending:
 start_total = time.time()
 results = {"success": 0, "skipped": 0, "failed": 0}
 audio_seconds = 0.0
+print(f"PROGRESS 0/{len(audios)}", flush=True)
 
 for idx, audio in enumerate(audios, 1):
     json_filename = f"{audio}.json"
     if audio not in pending:
         print(f"[{idx}/{len(audios)}] Skipping {audio} (exists)", flush=True)
         results["skipped"] += 1
+        print(f"PROGRESS {idx}/{len(audios)}", flush=True)
         continue
 
     number, title = split_audio_name(audio)
@@ -297,6 +303,10 @@ for idx, audio in enumerate(audios, 1):
         print(f"  [!] Transcription failed: {e}", flush=True)
         results["failed"] += 1
         # Continue with next file instead of crashing.
+    finally:
+        # Every path out of the loop body, including the early `continue`s,
+        # counts the file as handled.
+        print(f"PROGRESS {idx}/{len(audios)}", flush=True)
 
 elapsed_total = time.time() - start_total
 overall = f" — {audio_seconds / elapsed_total:.0f}x realtime" if elapsed_total > 0 and audio_seconds else ""

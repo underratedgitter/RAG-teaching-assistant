@@ -11,6 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # Batches in flight at once. Ollama serialises work internally, so a few is
@@ -104,7 +108,7 @@ def save_artifacts(df, corpus_id):
     tmp_meta = "embedding_matrix.meta.json.partial"
 
     try:
-        matrix = np.vstack(df["embedding"].values).astype(np.float32)
+        matrix = np.vstack(df["embedding"].values).astype(np.float32, copy=False)
         with open(tmp_matrix, "wb") as handle:
             np.save(handle, matrix)
             handle.flush()
@@ -288,6 +292,7 @@ os.makedirs("jsons", exist_ok=True)
 # Sorted so chunk_ids are stable from run to run; listdir order is arbitrary.
 jsons = sorted(f for f in os.listdir("jsons") if f.endswith('.json'))
 print(f"\n[*] Found {len(jsons)} JSON files")
+print(f"PROGRESS 0/{len(jsons)}", flush=True)
 
 my_dicts = []
 chunk_id = 0
@@ -320,6 +325,11 @@ for json_idx, json_file in enumerate(jsons, 1):
         else:
             cached_files += 1
             print("   [=] Reusing cached embeddings")
+        # Straight to float32 once the file is done: a list of Python floats
+        # takes around 30 bytes a value against 4 in an array, and keeping
+        # every file's lists until the matrix is built used gigabytes at 50k
+        # chunks. Only one file's lists are alive at a time now.
+        embeddings = np.asarray(embeddings, dtype=np.float32)
 
         for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
@@ -338,6 +348,8 @@ for json_idx, json_file in enumerate(jsons, 1):
         print(f"   [ERROR] Failed to process {json_file}: {e}")
         failed.append((json_file, str(e)))
         continue
+    finally:
+        print(f"PROGRESS {json_idx}/{len(jsons)}", flush=True)
 
 if not my_dicts:
     print("\n[ERROR] No chunks to process!")
