@@ -83,6 +83,7 @@ class WhisperModel:
 
 class _FakeOllama(BaseHTTPRequestHandler):
     hang = threading.Event()      # set: hold every request until released
+    drop = threading.Event()      # set: close the connection without answering
     seen = threading.Event()
     release = threading.Event()
 
@@ -97,6 +98,9 @@ class _FakeOllama(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.drop.is_set():
+            self.close_connection = True
+            return
         if self.hang.is_set():
             self.seen.set()
             self.release.wait(120)
@@ -146,7 +150,7 @@ def workspace(tmp_path):
         # A console that cannot print the file names: the stages must still run.
         PYTHONIOENCODING="ascii",
     )
-    for event in (_FakeOllama.hang, _FakeOllama.seen, _FakeOllama.release):
+    for event in (_FakeOllama.hang, _FakeOllama.seen, _FakeOllama.release, _FakeOllama.drop):
         event.clear()
     try:
         yield SimpleNamespace(root=work, env=env)
@@ -332,3 +336,21 @@ def test_a_deleted_lecture_leaves_the_index(workspace):
     assert "1_drop.mp4.mp3" in orphaned and "1_drop.mp4.mp3.json" in orphaned
     # The embedding cache of the removed transcript goes too.
     assert sorted(p.name for p in (root / ".embed_cache").iterdir()) == ["2_keep.mp4.mp3.json.npz"]
+
+
+def test_embedding_stops_after_the_first_unreachable_file(workspace):
+    """With Ollama gone, every later file would wait out the same refusal."""
+    jsons = workspace.root / "jsons"
+    jsons.mkdir()
+    for number in range(3):
+        (jsons / f"{number}_lecture.mp4.mp3.json").write_text(json.dumps({"chunks": [
+            {"number": str(number), "title": "lecture", "start": 0.0, "end": 5.0, "text": "some words"},
+        ]}), encoding="utf-8")
+    _FakeOllama.drop.set()
+
+    embedded = _run(workspace, "preprocess_json.py")
+
+    assert embedded.returncode == 1, embedded.stdout
+    assert embedded.stdout.count("[ERROR] Failed to process") == 1, embedded.stdout
+    assert "2 file(s) not embedded" in embedded.stdout
+    assert not (workspace.root / "chunks.json").exists()

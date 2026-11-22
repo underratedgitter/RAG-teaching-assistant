@@ -23,6 +23,8 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # Batches in flight at once. Ollama serialises work internally, so a few is
 # plenty — this is about not leaving the GPU idle between requests.
 EMBED_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "3"))
+# Seconds to wait for Ollama to embed one request; the dashboard's setting.
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 # Exit code when some inputs failed but the rest were processed.
 PARTIAL_FAILURE = 2
@@ -171,24 +173,35 @@ def save_artifacts(df, corpus_id):
             except OSError:
                 pass
 
-# Session with retry logic and connection pooling.
-#
-# allowed_methods matters: urllib3 only retries idempotent verbs by default
-# (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
-# retry block did nothing — every embedding call had zero retries.
-session = requests.Session()
-retry = Retry(
-    total=4,
-    connect=3,
-    read=3,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=frozenset(["POST", "GET"]),
-    raise_on_status=False,
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
-session.mount('http://', adapter)
-session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
+def _make_session():
+    """A session with retry logic and connection pooling.
+
+    allowed_methods matters: urllib3 only retries idempotent verbs by default
+    (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
+    retry block did nothing — every embedding call had zero retries.
+
+    read=False: a read timeout means Ollama took the request and is slow or
+    stuck, so sending the POST again would queue the same work a second time.
+    The timeout surfaces at once as ReadTimeout (read=0 would instead be
+    reported as a connection error).
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=4,
+        connect=3,
+        read=False,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["POST", "GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
+    return session
+
+
+session = _make_session()
 
 def _vectors(response, texts):
     """The embeddings in a reply, which must be one per text.
@@ -207,9 +220,13 @@ def _embed_batch(batch):
     try:
         r = session.post(f"{OLLAMA_URL}/api/embed",
             json={"model": EMBED_MODEL, "input": batch},
-            timeout=120)
+            timeout=OLLAMA_TIMEOUT)
         r.raise_for_status()
         return _vectors(r, batch)
+    except requests.exceptions.ConnectionError:
+        # Nobody is listening: asking again one text at a time would only
+        # wait out the same refusal once per text.
+        raise
     except requests.exceptions.RequestException as e:
         print(f"   [WARNING] Embedding request failed: {e}")
         if len(batch) == 1:
@@ -221,7 +238,7 @@ def _embed_batch(batch):
         for text in batch:
             r = session.post(f"{OLLAMA_URL}/api/embed",
                 json={"model": EMBED_MODEL, "input": [text]},
-                timeout=120)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
             out.extend(_vectors(r, [text]))
         return out
@@ -374,6 +391,15 @@ for json_idx, json_file in enumerate(jsons, 1):
         # skipped file cannot inflate the total.
         total_chunks += chunk_count
         print(f"   [OK] Embedded {chunk_count} chunks")
+    except requests.exceptions.ConnectionError as e:
+        # Ollama is gone, not unhappy with this one file: the rest would each
+        # wait out the same refusal, so stop and report what was not tried.
+        print(f"   [ERROR] Failed to process {json_file}: {e}")
+        failed.append((json_file, str(e)))
+        untried = jsons[json_idx:]
+        failed.extend((name, "not embedded: Ollama is unreachable") for name in untried)
+        print(f"   [ERROR] Ollama is unreachable; stopping with {len(untried)} file(s) not embedded.")
+        break
     except Exception as e:
         # Embedding is the slow part of this pipeline. Aborting the whole run
         # for one unreadable file threw away every file already embedded, so

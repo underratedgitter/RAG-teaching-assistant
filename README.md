@@ -49,7 +49,7 @@ A video you delete from `videos/` leaves the library the next time you run **Pro
 
 If the `small` model won't load it degrades to `base`, then `tiny`, and each size falls back through lower precisions first, rather than failing outright — a machine with less VRAM gets a worse transcript instead of no transcript.
 
-**3. `preprocess_json.py`** — Whisper's segments are too short to retrieve against on their own, so `merge_segments()` combines them into ~150-word chunks with a 30-word overlap. Overlap matters: it stops an answer being cut in half at a chunk boundary. A lecture's last few sentences (under a third of a chunk of new words) are folded into the chunk before instead of becoming a near-duplicate of it. Chunks are embedded with `nomic-embed-text` in batches of 128, several batches in flight at once, with a retrying HTTP session and a per-item retry when a whole batch is rejected.
+**3. `preprocess_json.py`** — Whisper's segments are too short to retrieve against on their own, so `merge_segments()` combines them into ~150-word chunks with a 30-word overlap. Overlap matters: it stops an answer being cut in half at a chunk boundary. A lecture's last few sentences (under a third of a chunk of new words) are folded into the chunk before instead of becoming a near-duplicate of it. Chunks are embedded with `nomic-embed-text` in batches of 128, several batches in flight at once, with a retrying HTTP session and a per-item retry when a whole batch is rejected. Connection failures are retried, but a request that times out (`OLLAMA_TIMEOUT`) is not sent a second time, and once Ollama is unreachable the stage stops and lists the files it did not embed instead of waiting out every one.
 
 Embeddings are cached per file under `.embed_cache/`, keyed by a hash of that file's chunk text and the model name. Adding one lecture to a library of twenty re-embeds one lecture, not twenty. Editing a transcript or switching embedding model invalidates only what changed.
 
@@ -130,7 +130,7 @@ before anything runs (see [Startup checks](#startup-checks)):
 | `WHISPER_VAD` | `1` | `0`, `1` | `0` transcribes silence too |
 | `WHISPER_CPU_THREADS` | all cores | whole number, 0-512 (`0` = all cores) | encoder threads on a CPU run |
 | `OLLAMA_URL` | `http://localhost:11434` | an `http://` or `https://` address | where Ollama listens |
-| `OLLAMA_TIMEOUT` | `120` | whole number of seconds, 1-3600 | how long the dashboard waits for Ollama to embed a question or write an answer; raise it on a slow machine |
+| `OLLAMA_TIMEOUT` | `120` | whole number of seconds, 1-3600 | how long the dashboard and `preprocess_json.py` wait for Ollama to embed or write an answer; raise it on a slow machine |
 | `EMBED_MODEL` | `nomic-embed-text` | an Ollama model name | embedding model |
 | `EMBED_CONCURRENCY` | `3` | whole number, 1-32 | embedding batches in flight at once |
 | `ANSWER_MODEL` | `qwen2.5:1.5b` | an Ollama model name | answering model |
