@@ -161,6 +161,8 @@ the command that fixes it.
 | `EMBED_MODEL` is pulled | `ollama pull nomic-embed-text` (or your model) | Process Videos and Ask |
 | `ANSWER_MODEL` is pulled | `ollama pull qwen2.5:1.5b` (or your model) | Ask |
 
+The dashboard runs these checks first, then, only if Ollama is not answering, starts it (`ollama serve`, listening where `OLLAMA_URL` points) and checks again. It does this only when `OLLAMA_URL` names this machine (`localhost`, `127.0.0.1` or `::1`) and the `ollama` command exists; for a remote Ollama it says so and leaves it alone.
+
 Problems appear in red under the buttons and in the terminal pane (and on the
 launching terminal), and only the buttons that need the missing piece are
 disabled. Fix the problem, then click **Re-check Setup**; no restart is needed.

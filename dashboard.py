@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
+from urllib.parse import urlparse
 
 import preflight
 
@@ -52,6 +53,9 @@ TOP_K = int(os.environ.get("TOP_K", "8"))    # chunks considered for the answer
 # configurable; the default keeps the previous behaviour.
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
 FALLBACK_K = int(os.environ.get("FALLBACK_K", "3"))    # used when nothing clears the threshold
+# Seconds to wait for an Ollama the dashboard started to begin answering.
+OLLAMA_START_WAIT_S = 30
+
 # Seconds to wait for Ollama to embed a question or write an answer. A cold
 # model on a slow machine can need longer than the default.
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
@@ -240,6 +244,23 @@ def _num_ctx(prompt_tokens):
     """
     needed = prompt_tokens + NUM_PREDICT
     return max(CONTEXT_STEP, -(-needed // CONTEXT_STEP) * CONTEXT_STEP)
+
+
+# Hosts on which a program here can start the Ollama server a URL names.
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _local_ollama_host(url):
+    """The OLLAMA_HOST value that makes a local server listen where url looks.
+
+    None when the URL names another machine: starting a server here would not
+    make that address answer.
+    """
+    parts = urlparse(url)
+    if parts.hostname not in _LOOPBACK_HOSTS:
+        return None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
 
 
 def _is_video(name):
@@ -546,46 +567,61 @@ class RAGDashboard:
             self.log(f"Could not open {path}: {e}")
 
     def _ensure_ollama_running(self):
-        """Check if Ollama is running, if not start it automatically."""
-        max_attempts = 30  # Try for 30 seconds
-        attempt = 0
-        ollama_started = False
+        """Start Ollama if it is not running. True when it was started and now answers.
 
+        Only a server on this machine is started, and only when the ollama
+        command exists; a remote OLLAMA_URL is somebody else's to start.
+        """
         with self._new_session() as session:
-            while attempt < max_attempts:
+            def answering():
                 try:
-                    # Try to connect to Ollama
-                    response = session.get(f"{OLLAMA_URL}/api/tags", timeout=2)
-                    if response.status_code == 200:
-                        self.log_safe("✓ Connected to Ollama server")
-                        return True
-                except Exception:
-                    pass
+                    return session.get(f"{OLLAMA_URL}/api/tags", timeout=2).status_code == 200
+                except requests.RequestException:
+                    return False
 
-                attempt += 1
-                if attempt == 1:
-                    self.log_safe("⏳ Ollama not detected. Attempting to start Ollama...")
-                    try:
-                        # Start Ollama in background
-                        subprocess.Popen("ollama serve", shell=True,
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
-                        ollama_started = True
-                    except Exception as e:
-                        self.log_safe(f"⚠ Could not auto-start Ollama: {str(e)}")
+            if answering():
+                return False
 
+            host = _local_ollama_host(OLLAMA_URL)
+            if host is None:
+                self.log_safe(f"⚠ Ollama is not reachable at {OLLAMA_URL}, which is not on this "
+                              "machine, so it is not started automatically. Start it there.")
+                return False
+            if shutil.which("ollama") is None:
+                self.log_safe("⚠ Ollama is not installed (there is no ollama command). "
+                              "Install it from https://ollama.com/download")
+                return False
+
+            self.log_safe("⏳ Ollama not detected. Attempting to start Ollama...")
+            try:
+                # An argument list, and OLLAMA_HOST set to where OLLAMA_URL
+                # looks, so the server listens where this program asks.
+                subprocess.Popen(["ollama", "serve"],
+                                 env={**os.environ, "OLLAMA_HOST": host},
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as e:
+                self.log_safe(f"⚠ Could not auto-start Ollama: {e}")
+                return False
+
+            for _ in range(OLLAMA_START_WAIT_S):
                 time.sleep(1)
-
-        if ollama_started:
+                if answering():
+                    self.log_safe("✓ Started Ollama")
+                    return True
             self.log_safe("⚠ Ollama started but not ready yet. Please try processing after a moment.")
-        else:
-            self.log_safe("⚠ Ollama not responding. Make sure Ollama is installed and run: ollama serve")
-        return False
+            return False
 
     def _startup(self):
-        """Start Ollama if needed, check the setup, then warm the models."""
-        self._ensure_ollama_running()
-        if preflight.ASK not in self._run_preflight():
+        """Check the setup, start Ollama if that is what is missing, then warm the models.
+
+        The checks come first so that a missing ffmpeg is reported at once,
+        not after up to OLLAMA_START_WAIT_S seconds spent waiting for Ollama.
+        """
+        blocked = self._run_preflight()
+        if preflight.ASK in blocked and self._ensure_ollama_running():
+            blocked = self._run_preflight()
+        if preflight.ASK not in blocked:
             # Pre-warm so the first question is not slowed by loading the models.
             self._warm_models()
 

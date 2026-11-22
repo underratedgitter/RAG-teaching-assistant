@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from types import MethodType, SimpleNamespace
 
 import numpy as np
@@ -34,6 +35,7 @@ LEGACY_ARTIFACT = "embeddings.joblib"
 _FUNCTIONS = {
     "_abort_on_bad_settings",
     "_matrix_matches_dataframe",
+    "_local_ollama_host",
     "_is_video",
     "_parse_progress",
     "_clean_field",
@@ -63,6 +65,7 @@ _METHODS = {
     "recheck_setup",
     "_apply_preflight",
     "_warm_models",
+    "_ensure_ollama_running",
 }
 _CONSTANTS = {
     "TOP_K",
@@ -82,6 +85,8 @@ _CONSTANTS = {
     "NUM_PREDICT",
     "CHARS_PER_TOKEN",
     "CONTEXT_STEP",
+    "OLLAMA_START_WAIT_S",
+    "_LOOPBACK_HOSTS",
     "EXCERPT_TAG_TOKENS",
     "MAX_CONTEXT_TOKENS",
     "PROMPT_OVERHEAD_TOKENS",
@@ -207,6 +212,8 @@ def _namespace():
         "sys": sys,
         "re": re,
         "secrets": secrets,
+        "time": time,
+        "urlparse": urlparse,
         "np": np,
         "pd": pd,
         "requests": requests,
@@ -1023,11 +1030,36 @@ def test_models_are_warmed_only_when_asking_works(ns, blocked, warmed):
     calls = []
     app = SimpleNamespace(
         _ensure_ollama_running=lambda: calls.append("ensure"),
-        _run_preflight=lambda: blocked,
+        _run_preflight=lambda: calls.append("preflight") or blocked,
         _warm_models=lambda: calls.append("warm"),
     )
     ns["_startup"](app)
-    assert calls == (["ensure", "warm"] if warmed else ["ensure"])
+    expected = ["preflight"] + (["warm"] if warmed else ["ensure"])
+    assert calls == expected
+
+
+def test_the_checks_are_reported_before_waiting_for_ollama_to_start(ns):
+    """Ollama can take 30 s to come up; a missing ffmpeg need not wait that long."""
+    calls = []
+    results = iter([frozenset({preflight.PROCESS, preflight.ASK}), frozenset()])
+    app = SimpleNamespace(
+        _ensure_ollama_running=lambda: calls.append("start") or True,
+        _run_preflight=lambda: calls.append("preflight") or next(results),
+        _warm_models=lambda: calls.append("warm"),
+    )
+    ns["_startup"](app)
+    assert calls == ["preflight", "start", "preflight", "warm"]
+
+
+def test_ollama_that_could_not_be_started_is_not_checked_again(ns):
+    calls = []
+    app = SimpleNamespace(
+        _ensure_ollama_running=lambda: calls.append("start") or False,
+        _run_preflight=lambda: calls.append("preflight") or frozenset({preflight.ASK}),
+        _warm_models=lambda: calls.append("warm"),
+    )
+    ns["_startup"](app)
+    assert calls == ["preflight", "start"]
 
 
 def test_rechecking_locks_the_button_and_runs_the_checks_off_the_tk_thread(ns):
@@ -1447,3 +1479,107 @@ def test_the_no_data_dialog_stays_short_when_nothing_was_rejected(ns):
     ns["ask_question"](app)
 
     assert warnings == [("No Data", "Process videos first!")]
+
+
+# ── starting Ollama ────────────────────────────────────────────────────────
+
+class _Probe:
+    """A session whose Ollama answers on the nth poll (never, when n is None)."""
+
+    def __init__(self, answers_on=None):
+        self.polls = 0
+        self.answers_on = answers_on
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, timeout=None):
+        assert url.endswith("/api/tags")
+        self.polls += 1
+        if self.answers_on is not None and self.polls >= self.answers_on:
+            return SimpleNamespace(status_code=200)
+        raise requests.exceptions.ConnectionError("refused")
+
+
+@pytest.fixture
+def launcher(ns, monkeypatch):
+    """The Ollama start-up with the process spawn, the clock and the CLI stubbed."""
+    started = []
+    sleeps = []
+    messages = []
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/ollama")
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **kwargs: started.append((args, kwargs)))
+    ns["time"] = SimpleNamespace(sleep=sleeps.append)
+    ns["OLLAMA_URL"] = "http://localhost:11434"
+
+    def run(probe):
+        app = SimpleNamespace(_new_session=lambda: probe, log_safe=messages.append)
+        return ns["_ensure_ollama_running"](app)
+
+    return SimpleNamespace(run=run, started=started, sleeps=sleeps, messages=messages, ns=ns)
+
+
+def test_a_running_ollama_is_left_alone(launcher):
+    assert launcher.run(_Probe(answers_on=1)) is False
+    assert launcher.started == [] and launcher.sleeps == []
+
+
+def test_a_local_ollama_that_is_not_running_is_started_with_an_argument_list(launcher):
+    assert launcher.run(_Probe(answers_on=3)) is True
+
+    [(args, kwargs)] = launcher.started
+    assert args == (["ollama", "serve"],)
+    assert not kwargs.get("shell")
+    assert kwargs["env"]["OLLAMA_HOST"] == "localhost:11434"
+
+
+def test_ollama_is_started_where_the_url_says_to_look_for_it(launcher):
+    launcher.ns["OLLAMA_URL"] = "http://127.0.0.1:12345"
+    launcher.run(_Probe(answers_on=2))
+    assert launcher.started[0][1]["env"]["OLLAMA_HOST"] == "127.0.0.1:12345"
+
+    launcher.ns["OLLAMA_URL"] = "http://[::1]:11434"
+    launcher.run(_Probe(answers_on=2))
+    assert launcher.started[1][1]["env"]["OLLAMA_HOST"] == "[::1]:11434"
+
+
+def test_a_remote_ollama_is_never_started_locally(launcher):
+    launcher.ns["OLLAMA_URL"] = "http://gpu-box.example:11434"
+
+    assert launcher.run(_Probe()) is False
+
+    assert launcher.started == [] and launcher.sleeps == []
+    assert any("gpu-box.example" in line and "not on this machine" in line
+               for line in launcher.messages)
+
+
+def test_a_missing_ollama_command_is_reported_without_waiting(launcher, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    assert launcher.run(_Probe()) is False
+
+    assert launcher.started == [] and launcher.sleeps == []
+    assert any("https://ollama.com/download" in line for line in launcher.messages)
+
+
+def test_an_ollama_that_never_comes_up_is_given_up_on_after_the_wait(launcher):
+    assert launcher.run(_Probe()) is False
+
+    assert len(launcher.started) == 1
+    assert len(launcher.sleeps) == launcher.ns["OLLAMA_START_WAIT_S"]
+    assert any("not ready yet" in line for line in launcher.messages)
+
+
+def test_a_failed_spawn_is_reported(launcher, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+
+    assert launcher.run(_Probe()) is False
+    assert any("Could not auto-start Ollama" in line for line in launcher.messages)
+    assert launcher.sleeps == []
