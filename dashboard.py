@@ -266,6 +266,17 @@ def _local_ollama_host(url):
     return f"{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
 
 
+def _format_size(size):
+    """A byte count in the unit a person reads: 1.0 KB, 2.5 GB."""
+    if size < 1024:
+        return f"{size} B"
+    value = size / 1024
+    for unit in ("KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
 def _is_video(name):
     """Whether a filename looks like a video the pipeline can process."""
     return name.lower().endswith(VIDEO_EXTENSIONS)
@@ -397,6 +408,7 @@ class RAGDashboard:
         # that is being replaced underneath it.
         self._processing = False
         self._answering = False
+        self._uploading = False         # a copy into videos/ is running on a worker
         # What the startup checks found missing. Each problem disables only
         # the actions it blocks, and the list is empty until the first check
         # finishes.
@@ -426,6 +438,7 @@ class RAGDashboard:
                     print(f"Warning: Could not create {dir_path}: {e}")
 
             self._clear_work_dirs_on_start()
+            self._remove_stale_uploads()
 
             self.load_embeddings()
 
@@ -877,34 +890,96 @@ class RAGDashboard:
             self.status_label.config(text="Ready")
 
     def upload_videos(self):
+        if self._uploading:
+            messagebox.showinfo("Busy", "An upload is already running.")
+            return
         files = filedialog.askopenfilenames(
             title="Select Videos",
             filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov")]
         )
-        if files:
-            for f in files:
-                name = os.path.basename(f)
+        if not files:
+            return
+
+        pending = []
+        for f in files:
+            name = os.path.basename(f)
+            if os.path.exists(os.path.join(self.videos_dir, name)):
+                self.log(f"Skipped (already uploaded): {name}")
+            elif any(name == queued for _, queued, _ in pending):
+                self.log(f"Skipped (chosen twice): {name}")
+            else:
+                try:
+                    pending.append((f, name, os.path.getsize(f)))
+                except OSError as e:
+                    # One unreadable file must not abort the whole batch.
+                    self.log(f"Could not upload {name}: {e}")
+
+        needed = sum(size for _, _, size in pending)
+        try:
+            free = shutil.disk_usage(self.videos_dir).free
+        except OSError:
+            free = None                 # unknown: let the copy itself report a full disk
+        if free is not None and needed > free:
+            self.log(f"Not enough disk space to upload {len(pending)} file(s): "
+                     f"{_format_size(needed)} needed, {_format_size(free)} free.")
+            pending = []
+        if not pending:
+            self.update_status()
+            return
+
+        # A recording can be several gigabytes: copied here it would freeze
+        # the window, so the copy runs on a worker and reports through the log.
+        self._uploading = True
+        self._sync_buttons()
+        threading.Thread(target=self._copy_uploads, args=(pending,), daemon=True).start()
+
+    def _copy_uploads(self, pending):
+        """Copy the chosen videos into videos/, one at a time (worker thread)."""
+        try:
+            for index, (source, name, size) in enumerate(pending, 1):
                 dest = os.path.join(self.videos_dir, name)
-                if os.path.exists(dest):
-                    self.log(f"Skipped (already uploaded): {name}")
-                    continue
+                self.log_safe(f"Uploading {index}/{len(pending)}: {name} ({_format_size(size)})...")
+                self._status(f"Uploading {index}/{len(pending)}: {name}")
                 # Copy under a name _is_video rejects and rename when done: a
                 # copy that dies midway must not leave a truncated recording
                 # that the next upload skips and the pipeline transcribes.
                 partial = os.path.join(self.videos_dir, f".{name}.partial")
                 try:
-                    shutil.copy2(f, partial)
+                    shutil.copy2(source, partial)
                     os.replace(partial, dest)
                 except OSError as e:
-                    # One unreadable file must not abort the whole batch.
-                    self.log(f"Could not upload {name}: {e}")
+                    self.log_safe(f"Could not upload {name}: {e}")
                     try:
                         os.remove(partial)
                     except OSError:
                         pass
                     continue
-                self.log(f"Uploaded: {name}")
-            self.update_status()
+                self.log_safe(f"Uploaded: {name}")
+        finally:
+            self._ui_queue.put(self._uploading_finished)
+
+    def _uploading_finished(self):
+        self._uploading = False
+        self._sync_buttons()
+        self.update_status()
+
+    def _remove_stale_uploads(self):
+        """Delete the partial copies an interrupted upload left in videos/.
+
+        Nothing is copying at launch, so any ".<name>.partial" there is the
+        remains of a copy that died with the window. Only that naming is
+        swept, never a pattern, so a user's own "*.partial" is safe.
+        """
+        try:
+            names = os.listdir(self.videos_dir)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(".") and name.endswith(".partial"):
+                try:
+                    os.remove(os.path.join(self.videos_dir, name))
+                except OSError as e:
+                    self.log(f"Could not remove {name}: {e}")
 
     def process_videos(self):
         try:
@@ -919,6 +994,9 @@ class RAGDashboard:
             return
         if self._answering:
             messagebox.showinfo("Busy", "Wait for the current answer to finish.")
+            return
+        if self._uploading:
+            messagebox.showinfo("Busy", "Wait for the upload to finish.")
             return
 
         self._cancel.clear()
@@ -1113,10 +1191,11 @@ class RAGDashboard:
         one while the other operation still needs it locked."""
         busy = self._processing or self._answering
         blocked = preflight.blocked_actions(self._problems)
+        # Processing reads videos/, which an upload is still writing.
         self.cancel_btn.config(
             state="normal" if self._processing and not self._cancel.is_set() else "disabled")
         self.process_btn.config(
-            state="disabled" if busy or preflight.PROCESS in blocked else "normal",
+            state="disabled" if busy or self._uploading or preflight.PROCESS in blocked else "normal",
             text="Processing..." if self._processing else "Process Videos",
         )
         self.ask_btn.config(

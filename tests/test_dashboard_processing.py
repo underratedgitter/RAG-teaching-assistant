@@ -97,6 +97,7 @@ def _app(ns, tmp_path, stages):
         _problems=[],
         _processing=True,
         _answering=False,
+        _uploading=False,
         _cancel=threading.Event(),
         _process_lock=threading.Lock(),
         _current_process=None,

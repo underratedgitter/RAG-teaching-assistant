@@ -36,6 +36,7 @@ _FUNCTIONS = {
     "_abort_on_bad_settings",
     "_matrix_matches_dataframe",
     "_local_ollama_host",
+    "_format_size",
     "_is_video",
     "_parse_progress",
     "_clean_field",
@@ -66,6 +67,9 @@ _METHODS = {
     "_apply_preflight",
     "_warm_models",
     "_ensure_ollama_running",
+    "_copy_uploads",
+    "_uploading_finished",
+    "_remove_stale_uploads",
 }
 _CONSTANTS = {
     "TOP_K",
@@ -315,15 +319,35 @@ def test_status_counts_an_uppercase_extension(ns, tmp_path):
 
 # ── uploading: skips and per-file failures ─────────────────────────────────
 
-def _upload_app(videos_dir):
+def _upload_app(videos_dir, ns=None):
+    """An app wired to the real upload methods, with the UI reduced to lists."""
     logs = []
     status_calls = []
     app = SimpleNamespace(
         videos_dir=str(videos_dir),
         log=logs.append,
+        log_safe=logs.append,
         update_status=lambda: status_calls.append(True),
+        _ui_queue=queue.Queue(),
+        _uploading=False,
+        _sync_calls=[],
     )
+    app._sync_buttons = lambda: app._sync_calls.append(app._uploading)
+    app._status = lambda text: logs.append(f"status: {text}")
+    if ns is not None:
+        app._copy_uploads = MethodType(ns["_copy_uploads"], app)
+        app._uploading_finished = MethodType(ns["_uploading_finished"], app)
     return app, logs, status_calls
+
+
+def _upload(ns, app):
+    """Choose files, then let the copy thread run and the Tk thread apply its updates."""
+    ns["threading"].threads.clear()
+    ns["upload_videos"](app)
+    for thread in ns["threading"].threads:
+        thread.target(*thread.args)
+    while not app._ui_queue.empty():
+        app._ui_queue.get()()
 
 
 def test_upload_skips_a_file_that_is_already_there(ns, tmp_path, monkeypatch):
@@ -339,8 +363,8 @@ def test_upload_skips_a_file_that_is_already_there(ns, tmp_path, monkeypatch):
 
     monkeypatch.setattr(shutil, "copy2", no_copy)
 
-    app, logs, status_calls = _upload_app(videos)
-    ns["upload_videos"](app)
+    app, logs, status_calls = _upload_app(videos, ns)
+    _upload(ns, app)
     assert "Skipped (already uploaded): lecture.mp4" in logs
     assert (videos / "lecture.mp4").read_bytes() == b"already here"
     assert status_calls == [True]
@@ -364,8 +388,8 @@ def test_a_failing_copy_does_not_stop_the_batch(ns, tmp_path, monkeypatch):
 
     monkeypatch.setattr(shutil, "copy2", fake_copy)
 
-    app, logs, status_calls = _upload_app(videos)
-    ns["upload_videos"](app)
+    app, logs, status_calls = _upload_app(videos, ns)
+    _upload(ns, app)
     assert any("Could not upload bad.mp4" in line for line in logs)
     assert (videos / "good.mp4").read_bytes() == b"good"
     assert not (videos / "bad.mp4").exists()
@@ -391,14 +415,14 @@ def test_a_copy_that_dies_midway_leaves_no_video_behind(ns, tmp_path, monkeypatc
         raise OSError("disk full")
 
     monkeypatch.setattr(shutil, "copy2", dies_midway)
-    app, logs, status_calls = _upload_app(videos)
-    ns["upload_videos"](app)
+    app, logs, status_calls = _upload_app(videos, ns)
+    _upload(ns, app)
     assert any("Could not upload lecture.mp4" in line for line in logs)
     assert os.listdir(videos) == []
 
     monkeypatch.setattr(shutil, "copy2", real_copy)
-    app, logs, status_calls = _upload_app(videos)
-    ns["upload_videos"](app)
+    app, logs, status_calls = _upload_app(videos, ns)
+    _upload(ns, app)
     assert "Uploaded: lecture.mp4" in logs
     assert (videos / "lecture.mp4").read_bytes() == b"the whole recording"
 
@@ -512,6 +536,7 @@ def _busy_app(ns, processing=False, answering=False):
         _cancel=threading.Event(),
         _processing=processing,
         _answering=answering,
+        _uploading=False,
         log=lambda text: None,
         _answer=lambda question: None,
     )
@@ -1583,3 +1608,193 @@ def test_a_failed_spawn_is_reported(launcher, monkeypatch):
     assert launcher.run(_Probe()) is False
     assert any("Could not auto-start Ollama" in line for line in launcher.messages)
     assert launcher.sleeps == []
+
+
+# ── uploading on a worker thread ───────────────────────────────────────────
+
+def _chosen(ns, *paths):
+    ns["filedialog"].askopenfilenames = lambda **kwargs: tuple(str(p) for p in paths)
+
+
+def test_a_copy_does_not_run_on_the_tk_thread(ns, tmp_path, monkeypatch):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"recording")
+    _chosen(ns, source)
+    copies = []
+    real_copy = shutil.copy2
+    monkeypatch.setattr(shutil, "copy2", lambda src, dst: copies.append(src) or real_copy(src, dst))
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    ns["upload_videos"](app)
+
+    assert copies == [] and os.listdir(videos) == []
+    [thread] = ns["threading"].threads
+    assert thread.target == app._copy_uploads and thread.daemon is True
+    assert app._uploading is True and app._sync_calls == [True]
+
+
+def test_progress_is_logged_for_each_file_as_it_is_copied(ns, tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"x" * 2048)
+    second.write_bytes(b"y")
+    _chosen(ns, first, second)
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert logs == [
+        "Uploading 1/2: first.mp4 (2.0 KB)...", "status: Uploading 1/2: first.mp4",
+        "Uploaded: first.mp4",
+        "Uploading 2/2: second.mp4 (1 B)...", "status: Uploading 2/2: second.mp4",
+        "Uploaded: second.mp4",
+    ]
+
+
+def test_the_buttons_come_back_when_the_upload_ends(ns, tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"recording")
+    _chosen(ns, source)
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert app._uploading is False
+    assert app._sync_calls == [True, False]
+    assert status_calls == [True]
+
+
+def test_the_buttons_come_back_even_when_every_copy_fails(ns, tmp_path, monkeypatch):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"recording")
+    _chosen(ns, source)
+
+    def broken(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copy2", broken)
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert app._uploading is False
+    assert any("Could not upload lecture.mp4: disk full" in line for line in logs)
+
+
+def test_an_upload_that_will_not_fit_is_refused_before_anything_is_copied(ns, tmp_path, monkeypatch):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"x" * 5000)
+    _chosen(ns, source)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=4000))
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert ns["threading"].threads == []
+    assert os.listdir(videos) == []
+    assert app._uploading is False
+    assert any("Not enough disk space" in line and "4.9 KB" in line and "3.9 KB" in line
+               for line in logs)
+
+
+def test_an_upload_that_fits_is_copied(ns, tmp_path, monkeypatch):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"x" * 5000)
+    _chosen(ns, source)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=5000))
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert (videos / "lecture.mp4").stat().st_size == 5000
+
+
+def test_the_same_name_chosen_twice_is_copied_once(ns, tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    one = tmp_path / "a" / "lecture.mp4"
+    two = tmp_path / "b" / "lecture.mp4"
+    one.write_bytes(b"first")
+    two.write_bytes(b"second")
+    _chosen(ns, one, two)
+    app, logs, status_calls = _upload_app(videos, ns)
+
+    _upload(ns, app)
+
+    assert (videos / "lecture.mp4").read_bytes() == b"first"
+    assert "Skipped (chosen twice): lecture.mp4" in logs
+
+
+def test_a_second_upload_is_ignored_while_one_is_running(ns, tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    shown = []
+    ns["messagebox"].showinfo = lambda title, message: shown.append(title)
+    _chosen(ns, tmp_path / "never-read.mp4")
+    app, logs, status_calls = _upload_app(videos, ns)
+    app._uploading = True
+
+    ns["upload_videos"](app)
+
+    assert shown == ["Busy"] and ns["threading"].threads == []
+
+
+def test_processing_is_locked_while_an_upload_runs(ns):
+    app = _busy_app(ns)
+    app._uploading = True
+
+    ns["_sync_buttons"](app)
+
+    assert app.process_btn.state == "disabled"
+    assert app.ask_btn.state == "normal"
+
+
+def test_processing_cannot_start_while_an_upload_runs(ns, tmp_path):
+    shown = []
+    ns["messagebox"].showinfo = lambda title, message: shown.append(title)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "lecture.mp4").write_bytes(b"recording")
+    app = SimpleNamespace(videos_dir=str(videos), log=lambda text: None,
+                          _processing=False, _answering=False, _uploading=True)
+
+    ns["process_videos"](app)
+
+    assert shown == ["Busy"] and ns["threading"].threads == []
+
+
+def test_start_up_sweeps_the_partial_copies_an_interrupted_upload_left(ns, tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / ".lecture.mp4.partial").write_bytes(b"half")
+    (videos / ".other lecture.mov.partial").write_bytes(b"half")
+    (videos / "kept.mp4").write_bytes(b"whole")
+    (videos / "notes.partial").write_text("mine")
+    (videos / ".hidden").write_text("mine")
+    app = SimpleNamespace(videos_dir=str(videos), log=lambda text: None)
+
+    ns["_remove_stale_uploads"](app)
+
+    assert sorted(os.listdir(videos)) == [".hidden", "kept.mp4", "notes.partial"]
+
+
+@pytest.mark.parametrize("size, text", [
+    (0, "0 B"), (1023, "1023 B"), (1024, "1.0 KB"), (5 * 1024 ** 2, "5.0 MB"),
+    (int(2.5 * 1024 ** 3), "2.5 GB"),
+])
+def test_sizes_are_shown_in_readable_units(ns, size, text):
+    assert ns["_format_size"](size) == text
