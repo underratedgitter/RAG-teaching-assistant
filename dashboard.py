@@ -12,19 +12,53 @@ import platform
 import json
 import re
 import secrets
+import signal
 import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
+from urllib.parse import urlparse
+
+import preflight
+
+
+def _abort_on_bad_settings():
+    """Refuse to start on an unusable environment variable, saying which.
+
+    The settings below are parsed at import, so an unchecked bad value would
+    be a traceback before any window exists.
+    """
+    errors = preflight.check_config()
+    if not errors:
+        return
+    text = "Invalid settings:\n" + "\n".join(f"- {error}" for error in errors)
+    print(text, file=sys.stderr)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("RAG Teaching Assistant", text)
+        root.destroy()
+    except tk.TclError:
+        pass                    # no display: the terminal message stands
+    sys.exit(1)
+
+
+_abort_on_bad_settings()
 
 # ── Retrieval tuning ─────────────────────────────────────────────────────────
 # Raise TOP_K to give the model more context at the cost of a longer prompt;
 # raise the threshold to be stricter about relevance.
-TOP_K = 8                   # chunks considered for the answer
+TOP_K = int(os.environ.get("TOP_K", "8"))    # chunks considered for the answer
 # A fixed cut-off cannot be validated for every embedding model, so it is
 # configurable; the default keeps the previous behaviour.
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
-FALLBACK_K = 3              # used when nothing clears the threshold
+FALLBACK_K = int(os.environ.get("FALLBACK_K", "3"))    # used when nothing clears the threshold
+# Seconds to wait for an Ollama the dashboard started to begin answering.
+OLLAMA_START_WAIT_S = 30
+
+# Seconds to wait for Ollama to embed a question or write an answer. A cold
+# model on a slow machine can need longer than the default.
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
@@ -46,6 +80,23 @@ PIPELINE_STEPS = (
     ("video_to_mp3.py", "Converting videos...", "Converting Videos", "video conversion"),
     ("mp3_to_json.py", "Transcribing (may take minutes)...", "Transcribing Audio", "transcription"),
     ("preprocess_json.py", "Creating embeddings...", "Creating Embeddings", "embedding creation"),
+)
+# Loading the finished index into memory is the stage after the scripts.
+STAGE_COUNT = len(PIPELINE_STEPS) + 1
+
+# The scripts report "PROGRESS done/total" on a line of their own.
+_PROGRESS_RE = re.compile(r"PROGRESS (\d+)/(\d+)")
+
+# Seconds a cancelled stage gets to stop on SIGTERM before it is killed.
+CANCEL_GRACE_S = 5
+
+# Temp files the scripts write next to their final names and rename into
+# place. Only the project root's own names are swept, never a pattern, so a
+# user's unrelated "*.partial" there is safe.
+ROOT_PARTIAL_FILES = (
+    "chunks.json.partial",
+    "embedding_matrix.npy.partial",
+    "embedding_matrix.meta.json.partial",
 )
 
 # Tkinter is not thread-safe, so worker threads queue their UI updates and
@@ -71,6 +122,16 @@ Instructions:
 - Be concise but thorough."""
 
 
+# Put just before the question when nothing cleared SIMILARITY_THRESHOLD and the
+# best few chunks were sent anyway. A small model told only to use the
+# excerpts answers from whatever it is given, and from its own memory when
+# they are unrelated; as an instruction beside the question this is followed.
+LOW_RELEVANCE_NOTE = (
+    "Retrieval scored the excerpts above as unrelated to the question below. "
+    "Unless an excerpt clearly answers it, say that the lectures do not cover it."
+)
+
+
 def _has_gpu_offload():
     """Whether Ollama can offload layers to a GPU on this machine.
 
@@ -83,7 +144,137 @@ def _has_gpu_offload():
     return True                                    # let Ollama decide elsewhere
 
 
-GENERATION_OPTIONS = {"num_predict": 300}
+# Tokens the model may write for one answer. An answer that reaches it is cut
+# off mid-sentence, which the dashboard says in the answer.
+NUM_PREDICT = int(os.environ.get("NUM_PREDICT", "300"))
+
+GENERATION_OPTIONS = {"num_predict": NUM_PREDICT}
+
+# Ollama silently drops the start of a prompt that does not fit its context
+# window, so the window is sized to the prompt and the excerpts are capped to
+# fit MAX_CONTEXT_TOKENS (context window, in tokens, that a request may use).
+CHARS_PER_TOKEN = 3
+CONTEXT_STEP = 4096              # num_ctx is asked for in multiples of this
+MAX_CONTEXT_TOKENS = 8192        # prompt plus answer
+EXCERPT_TAG_TOKENS = 40          # the tag line around each excerpt
+PROMPT_OVERHEAD_TOKENS = 200     # the framing lines and the question's tags
+
+
+def _parse_progress(line):
+    """(done, total) from a "PROGRESS done/total" line, else None."""
+    match = _PROGRESS_RE.fullmatch(line.strip())
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _stop_process_tree(process, force=False):
+    """Signal a stage and everything it started, such as its ffmpeg workers.
+
+    The stage runs in its own process group (see run_script), so one signal
+    reaches the workers too; stopping only the stage would leave ffmpeg
+    encoding on, with a temp file still open.
+    """
+    if sys.platform.startswith("win"):
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       capture_output=True)
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _wait_for_group_exit(process, timeout):
+    """Whether every process of a stopped stage's group is gone within timeout."""
+    if sys.platform.startswith("win"):
+        return True            # taskkill /T has already ended the tree
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            # macOS answers EPERM, not ESRCH, for a group whose only members
+            # are zombies awaiting their reap. Everything in it is ours, so
+            # EPERM cannot mean a process that is still running.
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _estimate_tokens(text):
+    """A rough token count for text, erring on the high side.
+
+    Three characters a token over-counts English a little, which is the safe
+    direction: the context window is requested a little large, not small.
+    """
+    return len(text) // CHARS_PER_TOKEN + 1
+
+
+def _excerpt_tokens(row):
+    """Tokens one excerpt costs in the prompt: its text and its tag line."""
+    return _estimate_tokens(str(row.get("text", ""))) + EXCERPT_TAG_TOKENS
+
+
+def _excerpt_budget(question):
+    """Tokens left for excerpts once the instructions, question and answer are paid for."""
+    used = (_estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(str(question))
+            + NUM_PREDICT + PROMPT_OVERHEAD_TOKENS)
+    return max(0, MAX_CONTEXT_TOKENS - used)
+
+
+def _fit_rows(rows, budget):
+    """The best-ranked rows that fit in the budget, in the order given.
+
+    The best row is always kept, however large, so an answer is never built
+    from nothing.
+    """
+    kept, used = [], 0
+    for row in rows:
+        cost = _excerpt_tokens(row)
+        if kept and used + cost > budget:
+            break
+        kept.append(row)
+        used += cost
+    return kept
+
+
+def _num_ctx(prompt_tokens):
+    """The context window to ask Ollama for: prompt plus answer, rounded up.
+
+    Ollama's default window is small, and a prompt that does not fit loses its
+    oldest text without any error. Rounding to a step keeps the requested
+    size, and so Ollama's loaded model, the same from question to question.
+    """
+    needed = prompt_tokens + NUM_PREDICT
+    return max(CONTEXT_STEP, -(-needed // CONTEXT_STEP) * CONTEXT_STEP)
+
+
+# Hosts on which a program here can start the Ollama server a URL names.
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _local_ollama_host(url):
+    """The OLLAMA_HOST value that makes a local server listen where url looks.
+
+    None when the URL names another machine: starting a server here would not
+    make that address answer.
+    """
+    parts = urlparse(url)
+    if parts.hostname not in _LOOPBACK_HOSTS:
+        return None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
+
+
+def _format_size(size):
+    """A byte count in the unit a person reads: 1.0 KB, 2.5 GB."""
+    if size < 1024:
+        return f"{size} B"
+    value = size / 1024
+    for unit in ("KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
 
 
 def _is_video(name):
@@ -117,12 +308,40 @@ def _time_parts(value):
     """Seconds as (minutes, seconds), for the timestamp shown to the model."""
     try:
         return divmod(int(value), 60)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # None, NaN, infinity
         return (0, 0)
 
 
-def build_prompt(rows, question, tag):
+def format_sources(rows, limit=3, low_relevance=False):
+    """A "Sources:" line for the chunks the answer drew on, best match first.
+
+    Built from the retrieved rows, not from the model's text: a small model
+    does not reliably write the timestamps it was given. Chunks that scored
+    below the threshold are not what the answer rests on, so they are listed
+    as the closest passages, not as sources.
+    """
+    seen = []
+    for row in rows:
+        mins_s, secs_s = _time_parts(row.get("start"))
+        mins_e, secs_e = _time_parts(row.get("end"))
+        source = (
+            f'Video {_clean_field(row.get("number", ""))} '
+            f'({_clean_field(row.get("title", ""))}) '
+            f"{mins_s}:{secs_s:02d}\u2013{mins_e}:{secs_e:02d}"
+        )
+        if source not in seen:
+            seen.append(source)
+    label = "Closest passages (low relevance):" if low_relevance else "Sources:"
+    return f"{label} " + "; ".join(seen[:limit])
+
+
+def build_prompt(rows, question, tag, low_relevance=False):
     """Build the user prompt: tagged excerpts, then the tagged question.
+
+    `rows` are best match first. They are written worst first, so the best
+    excerpt sits next to the question, where a small model attends most and
+    where truncation reaches last. `low_relevance` adds a note that the
+    retrieval scored them as unrelated to the question.
 
     The tag is random per request, so the system prompt cannot name it in
     advance and pasted content cannot guess the delimiter to fake a closing
@@ -132,7 +351,7 @@ def build_prompt(rows, question, tag):
         f"Excerpts are delimited by excerpt-{tag} tags; "
         f"the question is delimited by question-{tag}."
     ]
-    for row in rows:
+    for row in reversed(rows):
         mins_s, secs_s = _time_parts(row.get("start"))
         mins_e, secs_e = _time_parts(row.get("end"))
         parts.append(
@@ -142,6 +361,8 @@ def build_prompt(rows, question, tag):
             f'{_neutralise_tags(str(row.get("text", "")))}\n'
             f'</excerpt-{tag}>'
         )
+    if low_relevance:
+        parts.append(LOW_RELEVANCE_NOTE)
     parts.append(
         f"<question-{tag}>\n{_neutralise_tags(str(question))}\n</question-{tag}>"
     )
@@ -179,11 +400,25 @@ class RAGDashboard:
         # never meets a missing attribute.
         self.df = None
         self.embedding_matrix = None
+        # Why the saved index was refused, or None. Set by load_embeddings so
+        # the window can say so; the terminal line it prints is easy to miss.
+        self._index_problem = None
         # Read and written on the Tk thread only. A question and a
         # processing run never overlap, so an answer cannot read a corpus
         # that is being replaced underneath it.
         self._processing = False
         self._answering = False
+        self._uploading = False         # a copy into videos/ is running on a worker
+        # What the startup checks found missing. Each problem disables only
+        # the actions it blocks, and the list is empty until the first check
+        # finishes.
+        self._problems = []
+        # Cancelling is requested from the Tk thread and acted on by the
+        # worker. The lock makes "is a stage running, and which" one step, so
+        # a cancel cannot fall between a stage being checked and spawned.
+        self._cancel = threading.Event()
+        self._process_lock = threading.Lock()
+        self._current_process = None
         # The only thing a worker thread may do to the UI is put onto this:
         # a str is a terminal line, anything else is called on the Tk thread.
         self._ui_queue = queue.Queue()
@@ -203,22 +438,23 @@ class RAGDashboard:
                     print(f"Warning: Could not create {dir_path}: {e}")
 
             self._clear_work_dirs_on_start()
+            self._remove_stale_uploads()
 
             self.load_embeddings()
 
             self.create_ui()
+            if self._index_problem:
+                self.log(f"[WARNING] The saved index was not loaded: {self._index_problem}. "
+                         "Click 'Process Videos' to rebuild it.")
 
-            # Auto-start Ollama if not running
-            threading.Thread(target=self._ensure_ollama_running, daemon=True).start()
-
-            # Pre-warm Ollama models in background so first query is fast
-            threading.Thread(target=self._warm_models, daemon=True).start()
+            threading.Thread(target=self._startup, daemon=True).start()
 
         except Exception as e:
             print(f"Error during initialization: {e}")
             if not hasattr(self, "terminal"):
                 self.create_ui()  # Still create UI so app doesn't crash
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._stop_polling, add="+")
         self._drain_ui_queue()
 
@@ -274,11 +510,19 @@ class RAGDashboard:
         tk.Button(btn_frame, text="Upload Videos", command=self.upload_videos).pack(side="left", padx=(0,5))
         self.process_btn = tk.Button(btn_frame, text="Process Videos", command=self.process_videos)
         self.process_btn.pack(side="left", padx=(0,5))
+        self.cancel_btn = tk.Button(btn_frame, text="Cancel", command=self.cancel_processing,
+                                    state="disabled")
+        self.cancel_btn.pack(side="left", padx=(0,5))
         tk.Button(btn_frame, text="Open Folder", command=self.open_videos_folder).pack(side="left", padx=(0,5))
-        tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left")
+        tk.Button(btn_frame, text="Clear Terminal", command=self.clear_terminal).pack(side="left", padx=(0,5))
+        self.recheck_btn = tk.Button(btn_frame, text="Re-check Setup", command=self.recheck_setup)
+        self.recheck_btn.pack(side="left")
 
         self.status_label = tk.Label(self.root, text="", fg="gray")
         self.status_label.pack(anchor="w", padx=10, pady=5)
+
+        # Shown only while the startup checks have something to report.
+        self.setup_label = tk.Label(self.root, text="", fg="red", justify="left", wraplength=660)
 
         # Separator
         tk.Frame(self.root, height=1, bg="gray").pack(fill="x", padx=10, pady=5)
@@ -340,57 +584,110 @@ class RAGDashboard:
             self.log(f"Could not open {path}: {e}")
 
     def _ensure_ollama_running(self):
-        """Check if Ollama is running, if not start it automatically."""
-        max_attempts = 30  # Try for 30 seconds
-        attempt = 0
-        ollama_started = False
+        """Start Ollama if it is not running. True when it was started and now answers.
 
+        Only a server on this machine is started, and only when the ollama
+        command exists; a remote OLLAMA_URL is somebody else's to start.
+        """
         with self._new_session() as session:
-            while attempt < max_attempts:
+            def answering():
                 try:
-                    # Try to connect to Ollama
-                    response = session.get(f"{OLLAMA_URL}/api/tags", timeout=2)
-                    if response.status_code == 200:
-                        self.log_safe("✓ Connected to Ollama server")
-                        return True
-                except Exception:
-                    pass
+                    return session.get(f"{OLLAMA_URL}/api/tags", timeout=2).status_code == 200
+                except requests.RequestException:
+                    return False
 
-                attempt += 1
-                if attempt == 1:
-                    self.log_safe("⏳ Ollama not detected. Attempting to start Ollama...")
-                    try:
-                        # Start Ollama in background
-                        subprocess.Popen("ollama serve", shell=True,
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
-                        ollama_started = True
-                    except Exception as e:
-                        self.log_safe(f"⚠ Could not auto-start Ollama: {str(e)}")
+            if answering():
+                return False
 
+            host = _local_ollama_host(OLLAMA_URL)
+            if host is None:
+                self.log_safe(f"⚠ Ollama is not reachable at {OLLAMA_URL}, which is not on this "
+                              "machine, so it is not started automatically. Start it there.")
+                return False
+            if shutil.which("ollama") is None:
+                self.log_safe("⚠ Ollama is not installed (there is no ollama command). "
+                              "Install it from https://ollama.com/download")
+                return False
+
+            self.log_safe("⏳ Ollama not detected. Attempting to start Ollama...")
+            try:
+                # An argument list, and OLLAMA_HOST set to where OLLAMA_URL
+                # looks, so the server listens where this program asks.
+                subprocess.Popen(["ollama", "serve"],
+                                 env={**os.environ, "OLLAMA_HOST": host},
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as e:
+                self.log_safe(f"⚠ Could not auto-start Ollama: {e}")
+                return False
+
+            for _ in range(OLLAMA_START_WAIT_S):
                 time.sleep(1)
-
-        if ollama_started:
+                if answering():
+                    self.log_safe("✓ Started Ollama")
+                    return True
             self.log_safe("⚠ Ollama started but not ready yet. Please try processing after a moment.")
+            return False
+
+    def _startup(self):
+        """Check the setup, start Ollama if that is what is missing, then warm the models.
+
+        The checks come first so that a missing ffmpeg is reported at once,
+        not after up to OLLAMA_START_WAIT_S seconds spent waiting for Ollama.
+        """
+        blocked = self._run_preflight()
+        if preflight.ASK in blocked and self._ensure_ollama_running():
+            blocked = self._run_preflight()
+        if preflight.ASK not in blocked:
+            # Pre-warm so the first question is not slowed by loading the models.
+            self._warm_models()
+
+    def _run_preflight(self):
+        """Check every external piece, report it, and return the actions it blocks.
+
+        Runs on a worker thread: the checks touch the network and start a
+        child process. The result reaches the widgets through the queue.
+        """
+        problems = preflight.run_checks(OLLAMA_URL, EMBED_MODEL, ANSWER_MODEL)
+        if problems:
+            report = preflight.format_problems(problems)
+            print(f"[SETUP] Some checks failed:\n{report}", file=sys.stderr)
+            self.log_safe("⚠ Setup problems found:\n" + report)
         else:
-            self.log_safe("⚠ Ollama not responding. Make sure Ollama is installed and run: ollama serve")
-        return False
+            self.log_safe("✓ Setup checks passed: ffmpeg, faster-whisper, Ollama and both models.")
+        self._ui_queue.put(lambda: self._apply_preflight(problems))
+        return preflight.blocked_actions(problems)
+
+    def recheck_setup(self):
+        """Run the checks again, after the user has fixed something."""
+        self.recheck_btn.config(state="disabled")
+        threading.Thread(target=self._run_preflight, daemon=True).start()
+
+    def _apply_preflight(self, problems):
+        """Show the problems and lock only what they block (Tk thread only)."""
+        self._problems = problems
+        if problems:
+            self.setup_label.config(text="Setup incomplete (details and fixes in the terminal):\n"
+                                    + "\n".join(f"• {p.message}  Fix: {p.fix}" for p in problems))
+            self.setup_label.pack(anchor="w", padx=10, after=self.status_label)
+        else:
+            self.setup_label.pack_forget()
+        self.recheck_btn.config(state="normal")
+        self._sync_buttons()
 
     def _warm_models(self):
         """Pre-warm Ollama models to avoid cold-start latency."""
         try:
-            # Wait a bit for Ollama to be ready
-            time.sleep(2)
-
             with self._new_session() as session:
                 session.post(f"{OLLAMA_URL}/api/embed",
-                    json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=30)
+                    json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=OLLAMA_TIMEOUT)
                 session.post(f"{OLLAMA_URL}/api/generate",
                     json={"model": ANSWER_MODEL, "prompt": "hi", "stream": False,
-                          "options": {"num_predict": 1}}, timeout=30)
+                          "options": {"num_predict": 1, "num_ctx": CONTEXT_STEP}},
+                    timeout=OLLAMA_TIMEOUT)
             self.log_safe("✓ Ollama models warmed up - ready for queries.")
-        except Exception:
-            self.log_safe("⚠ Model warm-up in progress... (this is normal)")
+        except Exception as e:
+            self.log_safe(f"⚠ Model warm-up failed: {preflight.describe_ollama_error(e, ANSWER_MODEL)}")
 
     def _new_session(self):
         """An HTTP session for one worker thread, which must close it.
@@ -470,10 +767,13 @@ class RAGDashboard:
         matrix_path = os.path.join(self.base_dir, "embedding_matrix.npy")
         meta_path = os.path.join(self.base_dir, "embedding_matrix.meta.json")
 
+        self._index_problem = None
+
         def reject(reason):
             """Refuse a corpus we cannot trust, leaving no half-loaded state."""
             self.df = None
             self.embedding_matrix = None
+            self._index_problem = reason
             print(f"[WARNING] {reason}; ignoring it so Process Videos can rebuild.")
 
         try:
@@ -556,13 +856,21 @@ class RAGDashboard:
         query no longer recomputes norms for the whole corpus. This also stops
         the per-query `.astype(np.float32)` that copied the entire matrix
         (~30 MB at 10k chunks) every time someone asked something.
+
+        The work happens in place on one float32 buffer. Squaring for the
+        norms and dividing into a new array each held a second full copy of the
+        corpus while loading, which is what a 50k-chunk library (150 MB at 768
+        dimensions) cannot spare twice over.
         """
         if self.embedding_matrix is None:
             return
         m = np.ascontiguousarray(self.embedding_matrix, dtype=np.float32)
-        norms = np.linalg.norm(m, axis=1, keepdims=True)
+        if not m.flags.writeable:
+            m = m.copy()
+        norms = np.sqrt(np.einsum("ij,ij->i", m, m))
         norms[norms == 0] = 1.0          # a zero vector would divide by zero
-        self.embedding_matrix = m / norms
+        m /= norms[:, None]
+        self.embedding_matrix = m
 
     def update_status(self):
         """Update status label with error handling"""
@@ -582,25 +890,96 @@ class RAGDashboard:
             self.status_label.config(text="Ready")
 
     def upload_videos(self):
+        if self._uploading:
+            messagebox.showinfo("Busy", "An upload is already running.")
+            return
         files = filedialog.askopenfilenames(
             title="Select Videos",
             filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov")]
         )
-        if files:
-            for f in files:
-                name = os.path.basename(f)
-                dest = os.path.join(self.videos_dir, name)
-                if os.path.exists(dest):
-                    self.log(f"Skipped (already uploaded): {name}")
-                    continue
+        if not files:
+            return
+
+        pending = []
+        for f in files:
+            name = os.path.basename(f)
+            if os.path.exists(os.path.join(self.videos_dir, name)):
+                self.log(f"Skipped (already uploaded): {name}")
+            elif any(name == queued for _, queued, _ in pending):
+                self.log(f"Skipped (chosen twice): {name}")
+            else:
                 try:
-                    shutil.copy2(f, dest)
+                    pending.append((f, name, os.path.getsize(f)))
                 except OSError as e:
                     # One unreadable file must not abort the whole batch.
                     self.log(f"Could not upload {name}: {e}")
-                    continue
-                self.log(f"Uploaded: {name}")
+
+        needed = sum(size for _, _, size in pending)
+        try:
+            free = shutil.disk_usage(self.videos_dir).free
+        except OSError:
+            free = None                 # unknown: let the copy itself report a full disk
+        if free is not None and needed > free:
+            self.log(f"Not enough disk space to upload {len(pending)} file(s): "
+                     f"{_format_size(needed)} needed, {_format_size(free)} free.")
+            pending = []
+        if not pending:
             self.update_status()
+            return
+
+        # A recording can be several gigabytes: copied here it would freeze
+        # the window, so the copy runs on a worker and reports through the log.
+        self._uploading = True
+        self._sync_buttons()
+        threading.Thread(target=self._copy_uploads, args=(pending,), daemon=True).start()
+
+    def _copy_uploads(self, pending):
+        """Copy the chosen videos into videos/, one at a time (worker thread)."""
+        try:
+            for index, (source, name, size) in enumerate(pending, 1):
+                dest = os.path.join(self.videos_dir, name)
+                self.log_safe(f"Uploading {index}/{len(pending)}: {name} ({_format_size(size)})...")
+                self._status(f"Uploading {index}/{len(pending)}: {name}")
+                # Copy under a name _is_video rejects and rename when done: a
+                # copy that dies midway must not leave a truncated recording
+                # that the next upload skips and the pipeline transcribes.
+                partial = os.path.join(self.videos_dir, f".{name}.partial")
+                try:
+                    shutil.copy2(source, partial)
+                    os.replace(partial, dest)
+                except OSError as e:
+                    self.log_safe(f"Could not upload {name}: {e}")
+                    try:
+                        os.remove(partial)
+                    except OSError:
+                        pass
+                    continue
+                self.log_safe(f"Uploaded: {name}")
+        finally:
+            self._ui_queue.put(self._uploading_finished)
+
+    def _uploading_finished(self):
+        self._uploading = False
+        self._sync_buttons()
+        self.update_status()
+
+    def _remove_stale_uploads(self):
+        """Delete the partial copies an interrupted upload left in videos/.
+
+        Nothing is copying at launch, so any ".<name>.partial" there is the
+        remains of a copy that died with the window. Only that naming is
+        swept, never a pattern, so a user's own "*.partial" is safe.
+        """
+        try:
+            names = os.listdir(self.videos_dir)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(".") and name.endswith(".partial"):
+                try:
+                    os.remove(os.path.join(self.videos_dir, name))
+                except OSError as e:
+                    self.log(f"Could not remove {name}: {e}")
 
     def process_videos(self):
         try:
@@ -616,41 +995,157 @@ class RAGDashboard:
         if self._answering:
             messagebox.showinfo("Busy", "Wait for the current answer to finish.")
             return
+        if self._uploading:
+            messagebox.showinfo("Busy", "Wait for the upload to finish.")
+            return
 
+        self._cancel.clear()
         self._processing = True
         self._sync_buttons()
         self.clear_terminal()
         threading.Thread(target=self._process, daemon=True).start()
 
-    def run_script(self, script_name, step_name):
-        """Run a script and stream output to terminal"""
+    def run_script(self, script_name, step_name, on_progress=None):
+        """Run a script, stream its output to the terminal and return its exit code.
+
+        PROGRESS lines go to `on_progress(done, total)` instead of the
+        terminal. Returns None when the run was cancelled, with the script and
+        everything it started gone.
+        """
         self.log_safe(f"\n{'='*40}")
         self.log_safe(f"  {step_name}")
         self.log_safe(f"{'='*40}")
 
-        process = subprocess.Popen(
-            [sys.executable, script_name],
-            cwd=self.base_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",   # a non-UTF-8 byte in tool output must not kill the pipeline thread
-            bufsize=1
-        )
+        with self._process_lock:
+            if self._cancel.is_set():
+                return None
+            process = subprocess.Popen(
+                # -u: a piped child block-buffers its output, so scripts that do not
+                # flush would show nothing until they exit.
+                [sys.executable, "-u", script_name],
+                cwd=self.base_dir,
+                # File names are printed, so both ends agree on UTF-8 rather
+                # than on whatever the console's code page is.
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",   # a non-UTF-8 byte in tool output must not kill the pipeline thread
+                bufsize=1,
+                # Its own process group, so cancelling reaches ffmpeg as well.
+                start_new_session=not sys.platform.startswith("win"),
+            )
+            self._current_process = process
 
-        for line in process.stdout:
-            self.log_safe(line.rstrip())
+        try:
+            for line in process.stdout:
+                text = line.rstrip()
+                progress = _parse_progress(text)
+                if progress is None:
+                    self.log_safe(text)
+                elif on_progress is not None:
+                    on_progress(*progress)
+            process.wait()
+        finally:
+            with self._process_lock:
+                self._current_process = None
+            process.stdout.close()
 
-        process.wait()
+        if self._cancel.is_set():
+            # The stage can be gone while its ffmpeg workers are still
+            # closing their files; the sweep after this must not race them.
+            _wait_for_group_exit(process, CANCEL_GRACE_S + 1)
+            return None
         return process.returncode
+
+    def cancel_processing(self):
+        """Stop the running stage. Tk thread only.
+
+        The worker thread notices the cancelled run, sweeps the temp files and
+        re-enables the buttons. A stage that ignores SIGTERM is killed after
+        CANCEL_GRACE_S.
+        """
+        if not self._processing or self._cancel.is_set():
+            return
+        self._cancel.set()
+        self.log("Cancelling...")
+        self._sync_buttons()
+        with self._process_lock:
+            process = self._current_process
+            if process is not None:
+                _stop_process_tree(process)
+                killer = threading.Timer(CANCEL_GRACE_S, _stop_process_tree, (process, True))
+                killer.daemon = True
+                killer.start()
+
+    def _on_close(self):
+        """Close the window, stopping a running stage first. Tk thread only.
+
+        The stage runs in its own process group (see run_script), so closing
+        the window alone would leave it, and its ffmpeg workers, running on
+        with temp files open and nobody to report to.
+        """
+        if self._processing:
+            if not messagebox.askyesno(
+                "Processing in progress",
+                "Processing is still running. Close the window and stop it?\n\n"
+                "Finished work is kept; the next run resumes from it.",
+            ):
+                return
+            self._cancel.set()
+            with self._process_lock:
+                process = self._current_process
+            if process is not None:
+                _stop_process_tree(process)
+                if not _wait_for_group_exit(process, CANCEL_GRACE_S):
+                    _stop_process_tree(process, force=True)
+                    _wait_for_group_exit(process, CANCEL_GRACE_S)
+            self._remove_partial_files()
+        self.root.destroy()
+
+    def _remove_partial_files(self):
+        """Delete the temp files a stopped stage can leave behind.
+
+        Every output is written to a ".partial" file and renamed when done, so
+        a stage that is killed leaves finished files or temp files, never a
+        truncated finished file. Only the temp files need removing. The
+        stage is gone before this runs, so nothing is still writing them.
+        """
+        paths = [os.path.join(self.base_dir, name) for name in ROOT_PARTIAL_FILES]
+        for folder in (self.audios_dir, self.jsons_dir,
+                       os.path.join(self.base_dir, ".embed_cache")):
+            try:
+                paths.extend(os.path.join(folder, name) for name in os.listdir(folder)
+                             if name.endswith(".partial"))
+            except OSError:
+                continue
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                self.log_safe(f"Could not remove {path}: {e}")
+
+    def _cancelled(self):
+        self._remove_partial_files()
+        self._status("Cancelled")
+        self.log_safe("\n[CANCELLED] Processing stopped. Finished work is kept; the next run resumes from it.")
 
     def _process(self):
         try:
             incomplete = []
-            total = len(PIPELINE_STEPS)
             for n, (script, doing, title, noun) in enumerate(PIPELINE_STEPS, 1):
-                self._status(f"Step {n}/{total}: {doing}")
-                code = self.run_script(script, f"Step {n}/{total}: {title}")
+                self._status(f"Step {n}/{STAGE_COUNT}: {doing}")
+
+                def report(done, total, n=n, doing=doing):
+                    self._status(f"Step {n}/{STAGE_COUNT}: {doing} {done}/{total} files")
+
+                code = self.run_script(script, f"Step {n}/{STAGE_COUNT}: {title}", report)
+                if code is None:
+                    self._cancelled()
+                    return
                 if code == PARTIAL_FAILURE:
                     # One bad lecture must not block the others.
                     incomplete.append(noun)
@@ -658,9 +1153,20 @@ class RAGDashboard:
                     self._status(f"Error in {noun}")
                     return
 
+            if self._cancel.is_set():
+                self._cancelled()
+                return
+
+            self._status(f"Step {STAGE_COUNT}/{STAGE_COUNT}: Loading the index...")
             self.load_embeddings()
             chunks = len(self.df) if self.df is not None else 0
-            if incomplete:
+            if self.df is None:
+                # The stages succeeded but their output was refused: there is
+                # nothing to ask questions of, whatever the stages reported.
+                reason = self._index_problem or "no index was written"
+                self._status(f"Error: the index could not be loaded ({reason})")
+                self.log_safe(f"\n[ERROR] The index could not be loaded: {reason}.")
+            elif incomplete:
                 problems = ", ".join(incomplete)
                 self._status(f"{chunks} chunks indexed, with failures in {problems} (see terminal)")
                 self.log_safe(f"\n[WARNING] Finished with failures in {problems}. {chunks} chunks indexed.")
@@ -684,11 +1190,16 @@ class RAGDashboard:
         """Derive both buttons from the busy flags, so no caller can re-enable
         one while the other operation still needs it locked."""
         busy = self._processing or self._answering
+        blocked = preflight.blocked_actions(self._problems)
+        # Processing reads videos/, which an upload is still writing.
+        self.cancel_btn.config(
+            state="normal" if self._processing and not self._cancel.is_set() else "disabled")
         self.process_btn.config(
-            state="disabled" if busy else "normal",
+            state="disabled" if busy or self._uploading or preflight.PROCESS in blocked else "normal",
             text="Processing..." if self._processing else "Process Videos",
         )
-        self.ask_btn.config(state="disabled" if busy else "normal")
+        self.ask_btn.config(
+            state="disabled" if busy or preflight.ASK in blocked else "normal")
 
     def _status(self, text):
         self._ui_queue.put(lambda: self.status_label.config(text=text))
@@ -702,8 +1213,17 @@ class RAGDashboard:
         # an answer already in flight.
         if self._processing or self._answering:
             return
+        # The Return binding bypasses the disabled Ask button here too.
+        missing = [p for p in self._problems if preflight.ASK in p.blocks]
+        if missing:
+            self.response_text.delete("1.0", "end")
+            self.response_text.insert("1.0", "Cannot answer yet:\n" + preflight.format_problems(missing))
+            return
         if self.df is None:
-            messagebox.showwarning("No Data", "Process videos first!")
+            message = "Process videos first!"
+            if self._index_problem:
+                message += f"\n\nThe saved index was not loaded: {self._index_problem}."
+            messagebox.showwarning("No Data", message)
             return
 
         self._answering = True
@@ -715,11 +1235,12 @@ class RAGDashboard:
 
     def _answer(self, question):
         session = self._new_session()
+        model = EMBED_MODEL     # the model of the request in flight, named if it fails
         try:
             self.log_safe("Creating embedding...")
             r = session.post(f"{OLLAMA_URL}/api/embed",
                 json={"model": EMBED_MODEL, "input": [QUERY_PREFIX + question]},
-                timeout=30)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
             q_embed = r.json()["embeddings"][0]
 
@@ -734,9 +1255,10 @@ class RAGDashboard:
             sims = matrix @ (q / (qn if qn else 1.0))
 
             # argpartition is O(n); a full argsort was sorting every chunk to
-            # read the top few.
+            # read the top few. Selecting the largest k directly avoids a
+            # negated copy of every score.
             k = min(TOP_K, sims.shape[0])
-            cand = np.argpartition(-sims, k - 1)[:k]
+            cand = np.argpartition(sims, sims.shape[0] - k)[sims.shape[0] - k:]
             cand = cand[np.argsort(-sims[cand])]
 
             top_idx = [int(i) for i in cand if sims[i] > SIMILARITY_THRESHOLD]
@@ -761,10 +1283,12 @@ class RAGDashboard:
             chunks = df.iloc[top_idx]
 
             self.log_safe("Generating response...")
+            model = ANSWER_MODEL
             # The tag is random per request, so the system prompt cannot know
             # it in advance and pasted content cannot close its own block.
             tag = secrets.token_hex(8)
-            prompt = build_prompt(chunks.to_dict("records"), question, tag)
+            rows = _fit_rows(chunks.to_dict("records"), _excerpt_budget(question))
+            prompt = build_prompt(rows, question, tag, low_relevance=fallback)
 
             r = session.post(f"{OLLAMA_URL}/api/generate",
                 json={
@@ -772,34 +1296,42 @@ class RAGDashboard:
                     "system": SYSTEM_PROMPT,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {**GENERATION_OPTIONS, "temperature": 0.2, "top_p": 0.9}
+                    "options": {
+                        **GENERATION_OPTIONS,
+                        "num_ctx": _num_ctx(_estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(prompt)),
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                    }
                 },
-                timeout=120)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
-            response = r.json()["response"]
+            reply = r.json()
+            answer = reply["response"]
+            if reply.get("done_reason") == "length":
+                answer += "\n\n[answer truncated]"
+            response = f"{answer}\n\n{format_sources(rows, low_relevance=fallback)}"
 
             self.log_safe("Done!")
             self._ui_queue.put(lambda: self._show_response(response))
-        except requests.exceptions.Timeout:
-            self.log_safe("Error: Request timeout (is Ollama running?)")
-            self._ui_queue.put(lambda: self._show_response("Error: Connection timeout. Make sure Ollama is running: ollama serve"))
-        except requests.exceptions.ConnectionError:
-            self.log_safe("Error: Cannot connect to Ollama")
-            self._ui_queue.put(lambda: self._show_response("Error: Cannot connect to Ollama. Start it with: ollama serve"))
         except Exception as e:
-            self.log_safe(f"Error: {e}")
             # Bind the message now: Python unbinds `e` when the except block
-            # ends, before Tk runs the callback.
-            message = f"Error: {e}"
+            # ends, before Tk runs the callback. Whatever went wrong is shown
+            # in the answer area, never raised, so the window stays usable.
+            message = f"Error: {preflight.describe_ollama_error(e, model)}"
+            self.log_safe(message)
             self._ui_queue.put(lambda: self._show_response(message))
         finally:
             session.close()
 
     def _show_response(self, text):
-        self.response_text.delete("1.0", "end")
-        self.response_text.insert("1.0", text)
-        self._answering = False
-        self._sync_buttons()
+        # The flag is cleared even if the widget refuses the text, or the
+        # buttons would stay locked.
+        try:
+            self.response_text.delete("1.0", "end")
+            self.response_text.insert("1.0", text)
+        finally:
+            self._answering = False
+            self._sync_buttons()
 
 
 if __name__ == "__main__":

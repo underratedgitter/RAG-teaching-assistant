@@ -11,11 +11,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import preflight
+
+preflight.require(embeddings=True)
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # Batches in flight at once. Ollama serialises work internally, so a few is
 # plenty — this is about not leaving the GPU idle between requests.
 EMBED_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "3"))
+# Seconds to wait for Ollama to embed one request; the dashboard's setting.
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 # Exit code when some inputs failed but the rest were processed.
 PARTIAL_FAILURE = 2
@@ -80,6 +89,25 @@ def save_cached(json_file, texts, embeddings):
             pass
 
 
+def prune_cache(json_files):
+    """Delete cached embeddings whose transcript is gone.
+
+    A lecture whose video was deleted has its transcript moved out of
+    jsons/, and its cache would otherwise sit in .embed_cache/ for good.
+    """
+    wanted = {f"{name}.npz" for name in json_files}
+    try:
+        cached = os.listdir(CACHE_DIR)
+    except OSError:
+        return
+    for name in cached:
+        if name.endswith(".npz") and name not in wanted:
+            try:
+                os.remove(os.path.join(CACHE_DIR, name))
+            except OSError as e:
+                print(f"   [WARNING] Could not remove stale cache {name}: {e}")
+
+
 def _plain(value):
     """numpy scalars are not JSON types; unwrap them before dumping."""
     if isinstance(value, np.generic):
@@ -104,7 +132,7 @@ def save_artifacts(df, corpus_id):
     tmp_meta = "embedding_matrix.meta.json.partial"
 
     try:
-        matrix = np.vstack(df["embedding"].values).astype(np.float32)
+        matrix = np.vstack(df["embedding"].values).astype(np.float32, copy=False)
         with open(tmp_matrix, "wb") as handle:
             np.save(handle, matrix)
             handle.flush()
@@ -145,33 +173,60 @@ def save_artifacts(df, corpus_id):
             except OSError:
                 pass
 
-# Session with retry logic and connection pooling.
-#
-# allowed_methods matters: urllib3 only retries idempotent verbs by default
-# (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
-# retry block did nothing — every embedding call had zero retries.
-session = requests.Session()
-retry = Retry(
-    total=4,
-    connect=3,
-    read=3,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=frozenset(["POST", "GET"]),
-    raise_on_status=False,
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
-session.mount('http://', adapter)
-session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
+def _make_session():
+    """A session with retry logic and connection pooling.
+
+    allowed_methods matters: urllib3 only retries idempotent verbs by default
+    (GET, PUT, HEAD, DELETE, OPTIONS, TRACE), so without naming POST this whole
+    retry block did nothing — every embedding call had zero retries.
+
+    read=False: a read timeout means Ollama took the request and is slow or
+    stuck, so sending the POST again would queue the same work a second time.
+    The timeout surfaces at once as ReadTimeout (read=0 would instead be
+    reported as a connection error).
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=4,
+        connect=3,
+        read=False,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["POST", "GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)   # a remote OLLAMA_URL over TLS gets the same retries
+    return session
+
+
+session = _make_session()
+
+def _vectors(response, texts):
+    """The embeddings in a reply, which must be one per text.
+
+    Chunks are matched to vectors by position, so a reply with fewer vectors
+    than texts would silently attach every later vector to the wrong chunk.
+    """
+    vectors = response.json()["embeddings"]
+    if len(vectors) != len(texts):
+        raise ValueError(f"Ollama returned {len(vectors)} embeddings for {len(texts)} texts")
+    return vectors
+
 
 def _embed_batch(batch):
     """Embed one batch, falling back to one-at-a-time if the batch fails."""
     try:
         r = session.post(f"{OLLAMA_URL}/api/embed",
             json={"model": EMBED_MODEL, "input": batch},
-            timeout=120)
+            timeout=OLLAMA_TIMEOUT)
         r.raise_for_status()
-        return r.json()["embeddings"]
+        return _vectors(r, batch)
+    except requests.exceptions.ConnectionError:
+        # Nobody is listening: asking again one text at a time would only
+        # wait out the same refusal once per text.
+        raise
     except requests.exceptions.RequestException as e:
         print(f"   [WARNING] Embedding request failed: {e}")
         if len(batch) == 1:
@@ -183,9 +238,9 @@ def _embed_batch(batch):
         for text in batch:
             r = session.post(f"{OLLAMA_URL}/api/embed",
                 json={"model": EMBED_MODEL, "input": [text]},
-                timeout=120)
+                timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
-            out.extend(r.json()["embeddings"])
+            out.extend(_vectors(r, [text]))
         return out
 
 
@@ -234,6 +289,7 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
     merged = []
     buf = []       # segment dicts, so overlap keeps its own timing
     buf_words = 0  # running total
+    carried = 0    # segments at the front of buf that the previous chunk already holds
 
     def flush():
         merged.append({
@@ -258,11 +314,20 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
                 running += words
                 tail.insert(0, s)
             buf, buf_words = tail, running
+            carried = len(tail)
         buf.append(seg)
         buf_words += len(seg["text"].split())
 
     if buf:
-        flush()
+        new = buf[carried:]
+        if merged and sum(len(s["text"].split()) for s in new) < target_words / 3:
+            # A last chunk that is mostly the overlap already in the chunk
+            # before it would be a near-duplicate that ranks beside it, so
+            # its few new words join that chunk instead.
+            merged[-1]["end"] = new[-1]["end"]
+            merged[-1]["text"] = (merged[-1]["text"] + " " + " ".join(s["text"] for s in new)).strip()
+        else:
+            flush()
     return merged
 
 
@@ -276,6 +341,8 @@ os.makedirs("jsons", exist_ok=True)
 # Sorted so chunk_ids are stable from run to run; listdir order is arbitrary.
 jsons = sorted(f for f in os.listdir("jsons") if f.endswith('.json'))
 print(f"\n[*] Found {len(jsons)} JSON files")
+prune_cache(jsons)
+print(f"PROGRESS 0/{len(jsons)}", flush=True)
 
 my_dicts = []
 chunk_id = 0
@@ -289,6 +356,10 @@ for json_idx, json_file in enumerate(jsons, 1):
             content = json.load(f)
 
         raw_chunks = content['chunks']
+        if not raw_chunks:
+            # A recording with no speech: finished, with nothing to index.
+            print(f"\n[=] [{json_idx}/{len(jsons)}] {json_file}: no speech, nothing to index")
+            continue
         # Merge small segments into bigger overlapping chunks
         merged_chunks = merge_segments(raw_chunks, target_words=150, overlap_words=30)
         chunk_count = len(merged_chunks)
@@ -308,6 +379,11 @@ for json_idx, json_file in enumerate(jsons, 1):
         else:
             cached_files += 1
             print("   [=] Reusing cached embeddings")
+        # Straight to float32 once the file is done: a list of Python floats
+        # takes around 30 bytes a value against 4 in an array, and keeping
+        # every file's lists until the matrix is built used gigabytes at 50k
+        # chunks. Only one file's lists are alive at a time now.
+        embeddings = np.asarray(embeddings, dtype=np.float32)
 
         for i, chunk in enumerate(merged_chunks):
             chunk['chunk_id'] = chunk_id
@@ -319,6 +395,15 @@ for json_idx, json_file in enumerate(jsons, 1):
         # skipped file cannot inflate the total.
         total_chunks += chunk_count
         print(f"   [OK] Embedded {chunk_count} chunks")
+    except requests.exceptions.ConnectionError as e:
+        # Ollama is gone, not unhappy with this one file: the rest would each
+        # wait out the same refusal, so stop and report what was not tried.
+        print(f"   [ERROR] Failed to process {json_file}: {e}")
+        failed.append((json_file, str(e)))
+        untried = jsons[json_idx:]
+        failed.extend((name, "not embedded: Ollama is unreachable") for name in untried)
+        print(f"   [ERROR] Ollama is unreachable; stopping with {len(untried)} file(s) not embedded.")
+        break
     except Exception as e:
         # Embedding is the slow part of this pipeline. Aborting the whole run
         # for one unreadable file threw away every file already embedded, so
@@ -326,6 +411,8 @@ for json_idx, json_file in enumerate(jsons, 1):
         print(f"   [ERROR] Failed to process {json_file}: {e}")
         failed.append((json_file, str(e)))
         continue
+    finally:
+        print(f"PROGRESS {json_idx}/{len(jsons)}", flush=True)
 
 if not my_dicts:
     print("\n[ERROR] No chunks to process!")

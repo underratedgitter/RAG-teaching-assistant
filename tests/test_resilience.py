@@ -290,6 +290,10 @@ def test_actual_conversion_jobs_do_not_share_outputs(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(Path(args[args.index('-i') + 1]).read_bytes())
         return SimpleNamespace(returncode=0, stderr=b'')
     monkeypatch.setattr(subprocess, 'run', fake_ffmpeg)
+    # ffmpeg is faked above, so the preflight must not depend on a real one being installed (CI has none).
+    import shutil
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, 'which', lambda name, *a, **k: '/usr/bin/ffmpeg' if name == 'ffmpeg' else real_which(name, *a, **k))
     runpy.run_path(str(ROOT / 'video_to_mp3.py'))
     outputs = list((tmp_path / 'audios').glob('*.mp3'))
     assert len(outputs) == 2
@@ -449,13 +453,14 @@ def test_model_load_failure_is_reported_not_raised(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 0)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": AlwaysFailingWhisperModel,
         },
     )
@@ -531,8 +536,12 @@ def _run_transcription(monkeypatch):
     fake_ctranslate2.get_cuda_device_count = lambda: 0
     fake_faster_whisper = types.ModuleType("faster_whisper")
     fake_faster_whisper.WhisperModel = _StubWhisperModel
+    fake_utils = types.ModuleType("faster_whisper.utils")
+    fake_utils.download_model = lambda name, **kwargs: name
+    fake_faster_whisper.utils = fake_utils
     monkeypatch.setitem(sys.modules, "ctranslate2", fake_ctranslate2)
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_faster_whisper)
+    monkeypatch.setitem(sys.modules, "faster_whisper.utils", fake_utils)
     _StubWhisperModel.instances = []
 
     try:
@@ -688,3 +697,43 @@ def test_torch_is_no_longer_a_dependency():
     assert not any(ln.startswith("torch") for ln in reqs if ln)
     for script in ("mp3_to_json.py", "preprocess_json.py", "dashboard.py"):
         assert "import torch" not in (ROOT / script).read_text()
+
+
+def test_only_audio_without_a_video_is_orphaned(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    existing = {"1_lecture.mp3", "2_gone.mp4.mp3", "3_new.mkv.mp3", ".4_x.mp3.partial", "notes.txt"}
+    for name in existing:
+        (tmp_path / "audios" / name).write_bytes(b"audio")
+    files = ["lecture.mp4", "new.mkv"]
+    jobs = h["_plan_conversions"](files, existing)
+
+    assert h["_orphaned_audio"](files, jobs, existing) == ["2_gone.mp4.mp3"]
+
+
+def test_ambiguous_legacy_audio_is_not_orphaned(tmp_path, monkeypatch):
+    """Two videos share its stem: the ambiguity path moves it once they are converted."""
+    h = _video_helpers(tmp_path, monkeypatch)
+    existing = {"7_lecture.mp3"}
+    (tmp_path / "audios" / "7_lecture.mp3").write_bytes(b"audio")
+    files = ["lecture.mp4", "lecture.mov"]
+    jobs = h["_plan_conversions"](files, existing)
+
+    assert h["_orphaned_audio"](files, jobs, existing) == []
+
+
+def test_a_recording_with_no_speech_is_finished_not_failed(tmp_path, monkeypatch):
+    """Silence has nothing to transcribe: say so once, and never redo it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "audios").mkdir()
+    (tmp_path / "jsons").mkdir()
+    (tmp_path / "audios" / "1_silent.mp4.mp3").write_bytes(b"ID3" + b"\0" * 512)
+    monkeypatch.setattr(_StubModel, "transcribe", lambda self, path, **kw: (iter([]), _Info()))
+
+    assert _run_transcription(monkeypatch) == 0
+
+    transcript = tmp_path / "jsons" / "1_silent.mp4.mp3.json"
+    payload = json.loads(transcript.read_text(encoding="utf-8"))
+    assert payload["chunks"] == [] and payload["no_speech"] is True
+
+    assert _run_transcription(monkeypatch) == 0
+    assert not _StubWhisperModel.instances, "a silent recording was transcribed again"

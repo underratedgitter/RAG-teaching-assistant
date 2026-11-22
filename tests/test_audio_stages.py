@@ -47,6 +47,30 @@ def test_zero_byte_audio_keeps_same_output_name(tmp_path, monkeypatch):
     assert jobs == [("1_lecture.mp4.mp3", "lecture.mp4")]
 
 
+def test_ffmpeg_is_told_not_to_read_stdin(tmp_path, monkeypatch):
+    """Four ffmpegs run at once from worker threads, inheriting the terminal.
+
+    Without -nostdin each one reads keystrokes from it (ffmpeg's interactive
+    keys), swallowing input meant for the user and stalling when backgrounded.
+    """
+    h = _video_helpers(tmp_path, monkeypatch)
+    (tmp_path / "videos" / "lecture.mp4").write_bytes(b"video data")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        Path(argv[-1]).write_bytes(b"audio")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, _ = h["convert_video"](("1_lecture.mp4.mp3", "lecture.mp4"))
+
+    assert ok
+    (argv,) = calls
+    assert "-nostdin" in argv
+    assert argv.index("-nostdin") < argv.index("-i")
+
+
 def test_non_dict_json_transcript_treated_as_corrupt(tmp_path, monkeypatch):
     """Fix 5: a [] transcript returns False, is removed, and does not raise."""
     monkeypatch.chdir(tmp_path)
@@ -118,13 +142,14 @@ def test_cuda_exhausted_falls_back_to_cpu(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": StubCudaFailsCpuSucceeds,
         },
     )
@@ -148,16 +173,123 @@ def test_cuda_success_makes_no_cpu_attempt(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": StubCudaSucceeds,
         },
     )
     model = ns["load_model"]()
     assert model.device == "cuda"
     assert "cpu" not in StubCudaSucceeds.devices_attempted
+
+
+# ── fetching the Whisper weights once ──────────────────────────────────────
+
+def _model_loader(monkeypatch, download, whisper):
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
+    monkeypatch.delenv("WHISPER_MODEL", raising=False)
+    return load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model", "resolve_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "ctranslate2": type("ct", (), {
+                "get_cuda_device_count": staticmethod(lambda: 0)}),
+            "WhisperModel": whisper,
+            "download_model": download,
+        },
+    )
+
+
+def test_an_offline_first_run_says_the_weights_need_a_download(monkeypatch):
+    """One clear message, and no load attempt for every size and precision."""
+    downloads = []
+    loads = []
+
+    def offline(name, local_files_only=False, **kwargs):
+        downloads.append((name, local_files_only))
+        raise OSError("Cannot reach huggingface.co")
+
+    class Whisper:
+        def __init__(self, *args, **kwargs):
+            loads.append(args)
+
+    with pytest.raises(SystemExit) as stopped:
+        _model_loader(monkeypatch, offline, Whisper)["load_model"]()
+
+    message = str(stopped.value)
+    assert "download" in message and "internet" in message and "'base'" in message
+    assert "WHISPER_MODEL" in message
+    assert loads == []
+    # The first size is looked up in the cache, then fetched, once: not per
+    # precision. After that failure the smaller sizes are only looked up.
+    assert downloads == [("base", True), ("base", False), ("small", True), ("tiny", True)]
+
+
+def test_cached_weights_load_without_touching_the_network(monkeypatch):
+    downloads = []
+
+    def cached(name, local_files_only=False, **kwargs):
+        downloads.append(local_files_only)
+        if not local_files_only:
+            raise AssertionError("the network was used for weights that are cached")
+        return f"/cache/{name}"
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            self.path = path
+
+    model = _model_loader(monkeypatch, cached, Whisper)["load_model"]()
+
+    assert model.path == "/cache/base"
+    assert downloads == [True]
+
+
+def test_the_weights_are_resolved_once_across_precisions(monkeypatch):
+    downloads = []
+    tried = []
+
+    def fetch(name, local_files_only=False, **kwargs):
+        downloads.append(name)
+        return f"/cache/{name}"
+
+    class Whisper:
+        def __init__(self, path, compute_type, **kwargs):
+            tried.append(compute_type)
+            if compute_type == "int8":
+                raise RuntimeError("no int8 kernel")
+
+    _model_loader(monkeypatch, fetch, Whisper)["load_model"]()
+
+    assert tried == ["int8", "float32"]
+    assert downloads == ["base"]
+
+
+def test_a_local_model_folder_is_used_as_it_is(monkeypatch, tmp_path):
+    def fetch(*args, **kwargs):
+        raise AssertionError("a folder on disk needs no download")
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            self.path = path
+
+    monkeypatch.setenv("WHISPER_MODEL", str(tmp_path))
+    ns = load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model", "resolve_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 0)}),
+            "WhisperModel": Whisper,
+            "download_model": fetch,
+        },
+    )
+    assert ns["load_model"]().path == str(tmp_path)

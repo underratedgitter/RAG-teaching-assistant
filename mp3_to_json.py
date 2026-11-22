@@ -3,8 +3,18 @@ import os
 import sys
 import time
 
+import preflight
+
+# Before the heavy imports below, so a missing package is a message, not a traceback.
+preflight.require(whisper=True)
+
 import ctranslate2
 from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
+
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
 
 # Setup for performance and reliability
 os.makedirs("audios", exist_ok=True)
@@ -64,13 +74,51 @@ _cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "0")) or (os.cpu_count(
 model = None
 
 
+def resolve_model(name, allow_download=True):
+    """The local folder holding a Whisper model's weights.
+
+    Looks in the cache first, so a model that is already downloaded loads with
+    no network at all, and fetches it only when it is not there (and
+    allow_download says so). Done once per model rather than once per
+    precision: a failed download is the same failure however the weights
+    would have been loaded.
+    """
+    if os.path.isdir(name):
+        return name
+    try:
+        return download_model(name, local_files_only=True)
+    except Exception:
+        if not allow_download:
+            raise
+        return download_model(name)
+
+
 def load_model():
     """Load the Whisper model, falling back across precision and hardware."""
+    weights = {}
+    unavailable = []
+
+    def weights_of(name):
+        if name not in weights:
+            try:
+                # After one failed download the smaller models are tried from
+                # the cache only: the next download would wait out the same
+                # network failure.
+                weights[name] = resolve_model(name, allow_download=not unavailable)
+            except Exception as e:
+                print(f"[WARNING] Could not get the '{name}' model: {e}")
+                unavailable.append((name, e))
+                weights[name] = None
+        return weights[name]
+
     for _name in _model_ladder:
+        path = weights_of(_name)
+        if path is None:
+            continue
         for _ct in _compute_ladder:
             try:
                 loaded = WhisperModel(
-                    _name,
+                    path,
                     device=device,
                     compute_type=_ct,
                     cpu_threads=_cpu_threads if device == "cpu" else 0,
@@ -83,10 +131,13 @@ def load_model():
     if device == "cuda":
         print("[WARNING] CUDA model loading failed — falling back to CPU")
         for _name in _model_ladder:
+            path = weights_of(_name)
+            if path is None:
+                continue
             for _ct in ("int8", "float32"):
                 try:
                     loaded = WhisperModel(
-                        _name,
+                        path,
                         device="cpu",
                         compute_type=_ct,
                         cpu_threads=_cpu_threads,
@@ -96,6 +147,14 @@ def load_model():
                 except Exception as e:
                     print(f"[WARNING] Failed to load '{_name}' model as {_ct}: {e}")
 
+    if len(unavailable) == len(_model_ladder):
+        raise SystemExit(
+            f"Could not download the Whisper model '{_preferred}' ({unavailable[0][1]}). "
+            "The first transcription downloads the weights and needs an internet "
+            "connection; after that they are cached and nothing more is fetched. "
+            "Connect and run this again, or set WHISPER_MODEL to a folder that "
+            "already holds a downloaded model."
+        )
     raise SystemExit(
         "Could not load any Whisper model. Check the install and free disk space."
     )
@@ -133,6 +192,8 @@ def split_audio_name(audio):
 def already_transcribed(json_filename):
     """True only if the existing JSON is complete and parseable.
 
+    A transcript recording that the audio has no speech counts as complete.
+
     Checking the filename alone meant a transcript truncated by a crash or a
     Ctrl+C was skipped on every later run — permanently, and silently, since
     the file looked done. Anything unreadable is deleted so it gets redone.
@@ -145,7 +206,7 @@ def already_transcribed(json_filename):
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("transcript root must be an object")
-        return bool(data.get("chunks"))
+        return bool(data.get("chunks")) or data.get("no_speech") is True
     except (ValueError, OSError):   # ValueError covers JSON and Unicode decode errors
         print(f"  [!] {json_filename} is corrupt — re-transcribing")
         try:
@@ -213,12 +274,14 @@ if pending:
 start_total = time.time()
 results = {"success": 0, "skipped": 0, "failed": 0}
 audio_seconds = 0.0
+print(f"PROGRESS 0/{len(audios)}", flush=True)
 
 for idx, audio in enumerate(audios, 1):
     json_filename = f"{audio}.json"
     if audio not in pending:
         print(f"[{idx}/{len(audios)}] Skipping {audio} (exists)", flush=True)
         results["skipped"] += 1
+        print(f"PROGRESS {idx}/{len(audios)}", flush=True)
         continue
 
     number, title = split_audio_name(audio)
@@ -238,6 +301,7 @@ for idx, audio in enumerate(audios, 1):
 
         chunks = []
         text_parts = []
+        malformed = 0
         for seg in segments:
             try:
                 chunk = {
@@ -252,12 +316,16 @@ for idx, audio in enumerate(audios, 1):
                     text_parts.append(chunk["text"])
             except (ValueError, AttributeError, TypeError) as e:
                 print(f"  [WARNING] Skipped malformed segment: {e}")
+                malformed += 1
                 continue
 
-        if not chunks:
+        if not chunks and malformed:
             print("  [!] No valid chunks extracted")
             results["failed"] += 1
             continue
+        # Nothing malformed and nothing said: the recording has no speech. That
+        # is an answer, not a failure, so it is recorded and never redone.
+        no_speech = not chunks
 
         # Save with error handling
         try:
@@ -268,7 +336,8 @@ for idx, audio in enumerate(audios, 1):
                 json.dump({
                     "chunks": chunks,
                     "text": " ".join(text_parts),
-                    "language": getattr(info, "language", "en") or "en"
+                    "language": getattr(info, "language", "en") or "en",
+                    **({"no_speech": True} if no_speech else {}),
                 }, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
@@ -278,7 +347,10 @@ for idx, audio in enumerate(audios, 1):
             spoken = getattr(info, "duration", 0) or 0
             audio_seconds += spoken
             speed = f", {spoken / elapsed:.0f}x realtime" if elapsed > 0 and spoken else ""
-            print(f"  [+] Created {len(chunks)} chunks ({elapsed:.1f}s{speed})", flush=True)
+            if no_speech:
+                print(f"  [=] No speech detected ({elapsed:.1f}s); recorded an empty transcript", flush=True)
+            else:
+                print(f"  [+] Created {len(chunks)} chunks ({elapsed:.1f}s{speed})", flush=True)
             results["success"] += 1
         except Exception as e:
             print(f"  [!] Failed to save JSON: {e}")
@@ -297,6 +369,10 @@ for idx, audio in enumerate(audios, 1):
         print(f"  [!] Transcription failed: {e}", flush=True)
         results["failed"] += 1
         # Continue with next file instead of crashing.
+    finally:
+        # Every path out of the loop body, including the early `continue`s,
+        # counts the file as handled.
+        print(f"PROGRESS {idx}/{len(audios)}", flush=True)
 
 elapsed_total = time.time() - start_total
 overall = f" — {audio_seconds / elapsed_total:.0f}x realtime" if elapsed_total > 0 and audio_seconds else ""

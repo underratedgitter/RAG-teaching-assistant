@@ -16,13 +16,18 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
+import preflight
+
 DASHBOARD = Path(__file__).parents[1] / "dashboard.py"
 
 # The only methods allowed to call self.root.after*: both run on the Tk thread.
 _POLLER = "_drain_ui_queue"
 _POLL_STOPPER = "_stop_polling"
 
-_FUNCTIONS = {"_clean_field", "_neutralise_tags", "_time_parts", "build_prompt"}
+_FUNCTIONS = {
+    "_clean_field", "_neutralise_tags", "_time_parts", "build_prompt", "format_sources",
+    "_estimate_tokens", "_excerpt_tokens", "_excerpt_budget", "_fit_rows", "_num_ctx",
+}
 _METHODS = {
     "log",
     "log_safe",
@@ -37,13 +42,21 @@ _CONSTANTS = {
     "TOP_K",
     "SIMILARITY_THRESHOLD",
     "FALLBACK_K",
+    "OLLAMA_TIMEOUT",
     "OLLAMA_URL",
     "EMBED_MODEL",
     "ANSWER_MODEL",
     "_USES_TASK_PREFIX",
     "QUERY_PREFIX",
     "SYSTEM_PROMPT",
+    "LOW_RELEVANCE_NOTE",
     "GENERATION_OPTIONS",
+    "NUM_PREDICT",
+    "CHARS_PER_TOKEN",
+    "CONTEXT_STEP",
+    "EXCERPT_TAG_TOKENS",
+    "MAX_CONTEXT_TOKENS",
+    "PROMPT_OVERHEAD_TOKENS",
     "_TAG_RE",
     "UI_POLL_MS",
     "TERMINAL_MAX_LINES",
@@ -73,6 +86,7 @@ def _namespace():
         "secrets": secrets,
         "np": np,
         "requests": requests,
+        "preflight": preflight,
         "HTTPAdapter": HTTPAdapter,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(DASHBOARD), "exec"), ns)
@@ -392,7 +406,9 @@ def test_an_answer_thread_only_queues_its_result():
     assert app.root.scheduled == []
 
     app._drain_ui_queue()
-    assert events[-1] == ("response", "an answer")
+    assert events[-1] == (
+        "response", "an answer\n\nSources: Video 1 (Intro) 0:00\u20130:30",
+    )
     assert events[-2][0] == "insert" and events[-2][1].endswith("Done!\n")
 
 

@@ -8,6 +8,13 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
+import preflight
+
+preflight.require(ffmpeg=True)
+# A console that cannot encode a file name must not take a stage down: print
+# the name with escapes instead of raising UnicodeEncodeError mid-run.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 os.makedirs("audios", exist_ok=True)
 os.makedirs("videos", exist_ok=True)
 
@@ -218,6 +225,44 @@ def _quarantine_ambiguous_audio(files, existing_audios):
             print(f"  Preserved ambiguous legacy cache {name} in {backup}")
 
 
+def _orphaned_audio(files, jobs, existing_audios):
+    """Converted audio whose video is no longer in videos/.
+
+    Anything numbered like a conversion that no current video plans to reuse.
+    A legacy stem-named mp3 that still matches a current video's stem is left
+    to _quarantine_ambiguous_audio, which knows when it is safe to move.
+    """
+    planned = {output for output, _ in jobs}
+    stems = {os.path.splitext(filename)[0] for filename in files}
+    _, legacy, _ = _existing_audio_index(existing_audios)
+    ambiguous = {name for stem, names in legacy.items() if stem in stems for name in names}
+    return sorted(
+        name for name in existing_audios
+        if _split_audio_name(name)[0] is not None
+        and name not in planned and name not in ambiguous
+    )
+
+
+def _move_orphans(names):
+    """Move an orphan's audio, source record and transcript out of the library.
+
+    mp3_to_json.py transcribes every mp3 in audios/ and preprocess_json.py
+    indexes every transcript in jsons/, so a lecture whose video was deleted
+    would keep answering questions. It is moved to audios/.orphaned/ rather
+    than deleted: the audio and transcript took minutes to make.
+    """
+    directory = os.path.join("audios", ".orphaned")
+    for name in names:
+        os.makedirs(directory, exist_ok=True)
+        for source in (os.path.join("audios", name),
+                       _sidecar_path(os.path.join("audios", name)),
+                       os.path.join("jsons", f"{name}.json")):
+            if os.path.exists(source):
+                os.replace(source, os.path.join(directory, os.path.basename(source)))
+        _remove_transcript(name)    # a leftover temp transcript is worthless
+        print(f"  Moved {name} to {directory} (its video is no longer in videos/)")
+
+
 existing_audios = set(os.listdir("audios"))
 
 files = [f for f in os.listdir("videos") if f.lower().endswith(VIDEO_EXTENSIONS)]
@@ -242,7 +287,7 @@ def convert_video(args):
 
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", f"videos/{file}",
+            ["ffmpeg", "-nostdin", "-y", "-i", f"videos/{file}",
              "-vn",
              # Whisper works at 16 kHz mono and resamples anything else, so
              # producing that directly is cheaper to encode, smaller on disk,
@@ -289,12 +334,15 @@ start = time.time()
 max_workers = min(4, os.cpu_count() or 2)
 
 failures = []
+jobs = _plan_conversions(files, existing_audios)
+_move_orphans(_orphaned_audio(files, jobs, existing_audios))
+print(f"PROGRESS 0/{len(jobs)}", flush=True)
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    jobs = _plan_conversions(files, existing_audios)
     futures = [executor.submit(convert_video, job) for job in jobs]
-    for future in as_completed(futures):
+    for done, future in enumerate(as_completed(futures), 1):
         ok, message = future.result()
         print(f"  {message}")
+        print(f"PROGRESS {done}/{len(jobs)}", flush=True)
         if not ok:
             failures.append(message)
 

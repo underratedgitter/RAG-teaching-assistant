@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 import pytest
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from _pipeline import load
 
@@ -29,16 +31,17 @@ def load_module(monkeypatch, model="nomic-embed-text"):
     return load(
         "preprocess_json.py",
         functions={
-            "cache_key", "load_cached", "save_cached", "_embed_batch",
-            "create_embedding",
+            "cache_key", "load_cached", "save_cached", "_vectors", "_embed_batch",
+            "create_embedding", "_make_session",
         },
         constants={
             "OLLAMA_URL", "EMBED_MODEL", "EMBED_CONCURRENCY", "PARTIAL_FAILURE",
-            "CACHE_DIR", "DOCUMENT_PREFIX",
+            "CACHE_DIR", "DOCUMENT_PREFIX", "OLLAMA_TIMEOUT",
         },
         namespace={
             "os": os, "json": json, "hashlib": hashlib, "zipfile": zipfile,
             "time": time, "np": np, "pd": pd, "requests": requests,
+            "HTTPAdapter": HTTPAdapter, "Retry": Retry,
             "session": requests.Session(),
             "ThreadPoolExecutor": ThreadPoolExecutor, "as_completed": as_completed,
         },
@@ -240,6 +243,29 @@ def test_a_failing_batch_propagates(monkeypatch):
         m["create_embedding"]([f"{c}0" for c in "abcde"], batch_size=1)
 
 
+def test_a_short_reply_is_an_error_not_a_misalignment(monkeypatch):
+    """Fewer vectors than texts would shift every later chunk onto the wrong embedding."""
+    m = load_module(monkeypatch)
+
+    class FakeResponse:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"embeddings": [[float(len(t))] for t in self.texts[:-1]]}
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            return FakeResponse(json["input"])
+
+    m["session"] = FakeSession()
+    with pytest.raises(ValueError):
+        m["create_embedding"](["a", "bb", "ccc", "dddd"], batch_size=2)
+
+
 def test_failed_batch_with_failing_single_text_raises(monkeypatch):
     """When a batch fails and a text still fails alone, _embed_batch raises rather than shortening."""
     m = load_module(monkeypatch)
@@ -266,3 +292,77 @@ def test_failed_batch_with_failing_single_text_raises(monkeypatch):
     with pytest.raises(requests.exceptions.HTTPError):
         m["_embed_batch"](["a", "bad", "ccc"])
 
+
+
+# ── timeouts and retries ────────────────────────────────────────────────────
+
+def test_embedding_requests_wait_as_long_as_ollama_timeout_says(monkeypatch):
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "45")
+    m = load_module(monkeypatch)
+    timeouts = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"embeddings": [[1.0]]}
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            timeouts.append(timeout)
+            return FakeResponse()
+
+    m["session"] = FakeSession()
+    m["_embed_batch"](["a"])
+    assert timeouts == [45]
+
+
+def test_the_embedding_timeout_defaults_to_the_dashboards(monkeypatch):
+    monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
+    assert load_module(monkeypatch)["OLLAMA_TIMEOUT"] == 120
+
+
+def test_a_timed_out_post_is_not_sent_again(monkeypatch):
+    """Ollama accepted it and is slow: a retry would queue the same work twice."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    seen = []
+    release = threading.Event()
+
+    class Hangs(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.path)
+            release.wait(10)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Hangs)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        session = load_module(monkeypatch)["_make_session"]()
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            session.post(f"http://127.0.0.1:{server.server_address[1]}/api/embed",
+                         json={"input": ["a"]}, timeout=0.3)
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+    assert seen == ["/api/embed"]
+
+
+def test_an_unreachable_ollama_is_not_asked_again_text_by_text(monkeypatch):
+    m = load_module(monkeypatch)
+    calls = []
+
+    class FakeSession:
+        def post(self, url, json, timeout):
+            calls.append(json["input"])
+            raise requests.exceptions.ConnectionError("refused")
+
+    m["session"] = FakeSession()
+    with pytest.raises(requests.exceptions.ConnectionError):
+        m["_embed_batch"](["a", "b", "c"])
+    assert calls == [["a", "b", "c"]]
