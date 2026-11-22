@@ -551,6 +551,20 @@ def test_unreachable_ollama_lists_the_pulls_instead_of_guessing(tools, monkeypat
     assert "ollama pull qwen2.5:1.5b" in out
 
 
+def test_the_dashboard_is_said_to_start_only_a_local_ollama(tools, monkeypatch, capsys):
+    tools("ffmpeg")
+    tools("ollama")
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:1")
+    preflight.main()
+    assert "the dashboard will try to start it" in capsys.readouterr().out
+
+    monkeypatch.setenv("OLLAMA_URL", "http://gpu-box.invalid:11434")
+    preflight.main()
+    out = capsys.readouterr().out
+    assert "will try to start it" not in out
+    assert "is not on this machine" in out
+
+
 def test_auto_pull_pulls_each_missing_model(fake_ollama, tools, monkeypatch, tmp_path):
     url, installed = fake_ollama
     installed.append("nomic-embed-text:latest")

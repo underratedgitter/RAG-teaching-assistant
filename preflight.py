@@ -462,8 +462,12 @@ def main():
             continue
         print(f"missing  {problem.message}\n         Fix: {problem.fix}")
         if piece == "ollama":
-            print("         the dashboard will try to start it" if have_ollama_cli
-                  else "         install it from https://ollama.com/download")
+            if urlparse(url).hostname not in ("localhost", "127.0.0.1", "::1"):
+                print(f"         {url} is not on this machine, so the dashboard will not start it")
+            elif have_ollama_cli:
+                print("         the dashboard will try to start it")
+            else:
+                print("         install it from https://ollama.com/download")
             for model in models:
                 print(f"         then: ollama pull {model}")
             break
