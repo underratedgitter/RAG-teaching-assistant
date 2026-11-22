@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 _FUNCTIONS = {"_parse_progress", "_stop_process_tree", "_wait_for_group_exit"}
 _METHODS = {
     "run_script", "cancel_processing", "_remove_partial_files", "_cancelled",
-    "_process", "_processing_finished", "_sync_buttons", "_status", "log_safe",
+    "_process", "_processing_finished", "_sync_buttons", "_status", "log_safe", "_on_close",
 }
 _CONSTANTS = {
     "PIPELINE_STEPS", "STAGE_COUNT", "_PROGRESS_RE", "CANCEL_GRACE_S",
@@ -53,7 +53,8 @@ def _namespace():
             body.extend(c for c in node.body
                         if isinstance(c, ast.FunctionDef) and c.name in _METHODS)
     ns = {"os": os, "re": re, "signal": signal, "subprocess": subprocess,
-          "sys": sys, "threading": threading, "time": time, "preflight": preflight}
+          "sys": sys, "threading": threading, "time": time, "preflight": preflight,
+          "messagebox": SimpleNamespace(askyesno=lambda title, message: True)}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(DASHBOARD), "exec"), ns)
     return ns
 
@@ -408,3 +409,121 @@ def test_a_run_whose_index_cannot_be_loaded_is_an_error_not_a_success(tmp_path):
     assert "[ERROR] The index could not be loaded: the embedding matrix is missing" in log
     assert "[SUCCESS]" not in log
     assert app._processing is False
+
+
+# ── closing the window ─────────────────────────────────────────────────────
+
+class _Root:
+    def __init__(self):
+        self.destroyed = 0
+
+    def destroy(self):
+        self.destroyed += 1
+
+
+def _closing_app(ns, tmp_path, stages):
+    app = _app(ns, tmp_path, stages)
+    app.root = _Root()
+    return app
+
+
+def test_closing_while_processing_asks_then_stops_the_stage_and_its_workers(tmp_path):
+    ns = _namespace()
+    asked = []
+    ns["messagebox"].askyesno = lambda title, message: asked.append((title, message)) or True
+    app = _closing_app(ns, tmp_path, {"hang.py": HANGING_STAGE, "next.py": "open('next-ran', 'w')\n"})
+    (tmp_path / "audios" / "1_lecture.mp4.mp3").write_bytes(b"finished")
+
+    worker = _start(app)
+    assert _wait_for(lambda: (tmp_path / "worker.pid").exists() and _showing(app, "1/3"))
+    pid = int((tmp_path / "worker.pid").read_text())
+    stage = app._current_process
+
+    app._on_close()
+    worker.join(timeout=15)
+
+    assert len(asked) == 1 and "still running" in asked[0][1]
+    assert app.root.destroyed == 1
+    assert stage.poll() is not None, "the stage outlived the window"
+    assert _gone(pid), "the stage's own worker kept running"
+    assert not worker.is_alive()
+    assert not (tmp_path / "next-ran").exists()
+    assert not (tmp_path / "audios" / ".1_lecture.mp4.mp3.partial").exists()
+    assert not (tmp_path / "chunks.json.partial").exists()
+    assert (tmp_path / "audios" / "1_lecture.mp4.mp3").read_bytes() == b"finished"
+
+
+def test_declining_to_close_leaves_the_run_going(tmp_path):
+    ns = _namespace()
+    ns["messagebox"].askyesno = lambda title, message: False
+    app = _closing_app(ns, tmp_path, {"hang.py": HANGING_STAGE})
+
+    worker = _start(app)
+    assert _wait_for(lambda: (tmp_path / "worker.pid").exists() and _showing(app, "1/3"))
+    pid = int((tmp_path / "worker.pid").read_text())
+    stage = app._current_process
+    try:
+        app._on_close()
+
+        assert app.root.destroyed == 0
+        assert not app._cancel.is_set()
+        assert stage.poll() is None
+    finally:
+        app.cancel_processing()
+        worker.join(timeout=15)
+    assert _gone(pid)
+
+
+def test_closing_an_idle_window_just_closes_it(tmp_path):
+    ns = _namespace()
+
+    def never(title, message):
+        raise AssertionError("nothing is running, so there is nothing to confirm")
+
+    ns["messagebox"].askyesno = never
+    app = _closing_app(ns, tmp_path, {"a.py": ""})
+    app._processing = False
+
+    app._on_close()
+
+    assert app.root.destroyed == 1
+
+
+def test_closing_kills_a_stage_that_ignores_sigterm(tmp_path):
+    ns = _namespace()
+    ns["CANCEL_GRACE_S"] = 0.5
+    stubborn = (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open('stubborn.pid', 'w').write(str(os.getpid()))\n"
+        "print('PROGRESS 1/3', flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    app = _closing_app(ns, tmp_path, {"stubborn.py": stubborn})
+
+    worker = _start(app)
+    assert _wait_for(lambda: (tmp_path / "stubborn.pid").exists() and _showing(app, "1/3"))
+    pid = int((tmp_path / "stubborn.pid").read_text())
+
+    app._on_close()
+    worker.join(timeout=15)
+
+    assert app.root.destroyed == 1
+    assert _gone(pid)
+
+
+def test_the_window_manager_close_button_is_wired_to_the_handler():
+    source = DASHBOARD.read_text(encoding="utf-8")
+    assert 'self.root.protocol("WM_DELETE_WINDOW", self._on_close)' in source
+
+
+def test_a_group_of_zombies_counts_as_gone(monkeypatch):
+    """macOS reports EPERM, not ESRCH, for a process group nobody has reaped yet."""
+    ns = _namespace()
+
+    def killpg(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    assert ns["_wait_for_group_exit"](SimpleNamespace(pid=12345), 0.1) is True

@@ -191,7 +191,10 @@ def _wait_for_group_exit(process, timeout):
     while True:
         try:
             os.killpg(process.pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS answers EPERM, not ESRCH, for a group whose only members
+            # are zombies awaiting their reap. Everything in it is ours, so
+            # EPERM cannot mean a process that is still running.
             return True
         if time.monotonic() >= deadline:
             return False
@@ -438,6 +441,7 @@ class RAGDashboard:
             if not hasattr(self, "terminal"):
                 self.create_ui()  # Still create UI so app doesn't crash
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._stop_polling, add="+")
         self._drain_ui_queue()
 
@@ -996,6 +1000,31 @@ class RAGDashboard:
                 killer = threading.Timer(CANCEL_GRACE_S, _stop_process_tree, (process, True))
                 killer.daemon = True
                 killer.start()
+
+    def _on_close(self):
+        """Close the window, stopping a running stage first. Tk thread only.
+
+        The stage runs in its own process group (see run_script), so closing
+        the window alone would leave it, and its ffmpeg workers, running on
+        with temp files open and nobody to report to.
+        """
+        if self._processing:
+            if not messagebox.askyesno(
+                "Processing in progress",
+                "Processing is still running. Close the window and stop it?\n\n"
+                "Finished work is kept; the next run resumes from it.",
+            ):
+                return
+            self._cancel.set()
+            with self._process_lock:
+                process = self._current_process
+            if process is not None:
+                _stop_process_tree(process)
+                if not _wait_for_group_exit(process, CANCEL_GRACE_S):
+                    _stop_process_tree(process, force=True)
+                    _wait_for_group_exit(process, CANCEL_GRACE_S)
+            self._remove_partial_files()
+        self.root.destroy()
 
     def _remove_partial_files(self):
         """Delete the temp files a stopped stage can leave behind.
