@@ -130,7 +130,11 @@ def _has_gpu_offload():
     return True                                    # let Ollama decide elsewhere
 
 
-GENERATION_OPTIONS = {"num_predict": 300}
+# Tokens the model may write for one answer. An answer that reaches it is cut
+# off mid-sentence, which the dashboard says in the answer.
+NUM_PREDICT = int(os.environ.get("NUM_PREDICT", "300"))
+
+GENERATION_OPTIONS = {"num_predict": NUM_PREDICT}
 
 
 def _parse_progress(line):
@@ -1056,7 +1060,11 @@ class RAGDashboard:
                 },
                 timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()
-            response = f'{r.json()["response"]}\n\n{format_sources(rows)}'
+            reply = r.json()
+            answer = reply["response"]
+            if reply.get("done_reason") == "length":
+                answer += "\n\n[answer truncated]"
+            response = f"{answer}\n\n{format_sources(rows)}"
 
             self.log_safe("Done!")
             self._ui_queue.put(lambda: self._show_response(response))

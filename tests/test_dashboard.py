@@ -73,6 +73,7 @@ _CONSTANTS = {
     "SYSTEM_PROMPT",
     "VIDEO_EXTENSIONS",
     "GENERATION_OPTIONS",
+    "NUM_PREDICT",
     "_TAG_RE",
     "_PROGRESS_RE",
 }
@@ -1184,3 +1185,64 @@ def test_valid_settings_let_the_dashboard_start(ns, monkeypatch):
     _settings_check(ns, tk, monkeypatch, TOP_K="12")
     ns["_abort_on_bad_settings"]()
     assert tk.dialogs == []
+
+
+# ── the length of an answer ────────────────────────────────────────────────
+
+class _LengthSession(_StubSession):
+    """An Ollama that stopped writing because it hit num_predict."""
+
+    def __init__(self, done_reason):
+        super().__init__()
+        self.done_reason = done_reason
+
+    def post(self, url, json=None, timeout=None):
+        reply = super().post(url, json=json, timeout=timeout)
+        if url.endswith("/api/generate"):
+            reply._payload["done_reason"] = self.done_reason
+        return reply
+
+
+def test_an_answer_cut_off_at_the_length_limit_says_so(ns):
+    df, matrix = _corpus([0.9])
+    app, _, _ = _answer_app(df, matrix)
+    app._new_session = lambda: _LengthSession("length")
+
+    ns["_answer"](app, "What is this?")
+
+    assert _shown(app) == (
+        "an answer\n\n[answer truncated]\n\n"
+        "Sources: Video 1 (Lecture 1) 0:00–0:30"
+    )
+
+
+def test_an_answer_that_finished_is_not_marked(ns):
+    df, matrix = _corpus([0.9])
+    app, _, _ = _answer_app(df, matrix)
+    app._new_session = lambda: _LengthSession("stop")
+
+    ns["_answer"](app, "What is this?")
+
+    assert "truncated" not in _shown(app)
+
+
+def test_the_answer_length_defaults_to_300_tokens(monkeypatch):
+    monkeypatch.delenv("NUM_PREDICT", raising=False)
+    ns = _namespace()
+    df, matrix = _corpus([0.9])
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _request(session, "/api/generate")["json"]["options"]["num_predict"] == 300
+
+
+def test_the_answer_length_can_be_set_from_the_environment(monkeypatch):
+    monkeypatch.setenv("NUM_PREDICT", "700")
+    ns = _namespace()
+    df, matrix = _corpus([0.9])
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _request(session, "/api/generate")["json"]["options"]["num_predict"] == 700

@@ -136,6 +136,7 @@ before anything runs (see [Startup checks](#startup-checks)):
 | `EMBED_MODEL` | `nomic-embed-text` | an Ollama model name | embedding model |
 | `EMBED_CONCURRENCY` | `3` | whole number, 1-32 | embedding batches in flight at once |
 | `ANSWER_MODEL` | `qwen2.5:1.5b` | an Ollama model name | answering model |
+| `NUM_PREDICT` | `300` | whole number, 16-4096 | most tokens the model may write for one answer; an answer that reaches it ends with `[answer truncated]` |
 | `SIMILARITY_THRESHOLD` | `0.3` | number, -1 to 1 | cosine similarity below which a chunk is treated as unrelated |
 | `TOP_K` | `8` | whole number, 1-100 | chunks passed to the model as context |
 | `FALLBACK_K` | `3` | whole number, 1-100 | chunks used when nothing clears the threshold |

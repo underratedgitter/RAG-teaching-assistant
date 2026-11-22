@@ -138,6 +138,7 @@ SETTINGS = (
     ("TOP_K", _integer(1, 100), False),
     ("FALLBACK_K", _integer(1, 100), False),
     ("OLLAMA_TIMEOUT", _integer(1, 3600), False),
+    ("NUM_PREDICT", _integer(16, 4096), False),
     ("WHISPER_MODEL", _whisper_model, False),
     ("WHISPER_DEVICE", _choice("cpu", "cuda"), True),
     ("WHISPER_COMPUTE_TYPE", _choice(
