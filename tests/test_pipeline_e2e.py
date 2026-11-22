@@ -354,3 +354,19 @@ def test_embedding_stops_after_the_first_unreachable_file(workspace):
     assert embedded.stdout.count("[ERROR] Failed to process") == 1, embedded.stdout
     assert "2 file(s) not embedded" in embedded.stdout
     assert not (workspace.root / "chunks.json").exists()
+
+
+def test_a_transcript_with_no_speech_is_not_a_failed_embedding(workspace):
+    jsons = workspace.root / "jsons"
+    jsons.mkdir()
+    spoken = {"chunks": [{"number": "1", "title": "talk", "start": 0.0, "end": 5.0, "text": "some words"}]}
+    silent = {"chunks": [], "text": "", "language": "en", "no_speech": True}
+    (jsons / "1_talk.mp4.mp3.json").write_text(json.dumps(spoken), encoding="utf-8")
+    (jsons / "2_silent.mp4.mp3.json").write_text(json.dumps(silent), encoding="utf-8")
+
+    embedded = _run(workspace, "preprocess_json.py")
+
+    assert embedded.returncode == 0, embedded.stdout
+    assert "no speech" in embedded.stdout
+    assert set(_dashboard_loader(workspace).df["title"]) == {"talk"}
+    assert _progress(embedded.stdout) == [(0, 2), (1, 2), (2, 2)]

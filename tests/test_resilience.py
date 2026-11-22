@@ -710,3 +710,21 @@ def test_ambiguous_legacy_audio_is_not_orphaned(tmp_path, monkeypatch):
     jobs = h["_plan_conversions"](files, existing)
 
     assert h["_orphaned_audio"](files, jobs, existing) == []
+
+
+def test_a_recording_with_no_speech_is_finished_not_failed(tmp_path, monkeypatch):
+    """Silence has nothing to transcribe: say so once, and never redo it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "audios").mkdir()
+    (tmp_path / "jsons").mkdir()
+    (tmp_path / "audios" / "1_silent.mp4.mp3").write_bytes(b"ID3" + b"\0" * 512)
+    monkeypatch.setattr(_StubModel, "transcribe", lambda self, path, **kw: (iter([]), _Info()))
+
+    assert _run_transcription(monkeypatch) == 0
+
+    transcript = tmp_path / "jsons" / "1_silent.mp4.mp3.json"
+    payload = json.loads(transcript.read_text(encoding="utf-8"))
+    assert payload["chunks"] == [] and payload["no_speech"] is True
+
+    assert _run_transcription(monkeypatch) == 0
+    assert not _StubWhisperModel.instances, "a silent recording was transcribed again"

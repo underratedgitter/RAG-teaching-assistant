@@ -142,6 +142,8 @@ def split_audio_name(audio):
 def already_transcribed(json_filename):
     """True only if the existing JSON is complete and parseable.
 
+    A transcript recording that the audio has no speech counts as complete.
+
     Checking the filename alone meant a transcript truncated by a crash or a
     Ctrl+C was skipped on every later run — permanently, and silently, since
     the file looked done. Anything unreadable is deleted so it gets redone.
@@ -154,7 +156,7 @@ def already_transcribed(json_filename):
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("transcript root must be an object")
-        return bool(data.get("chunks"))
+        return bool(data.get("chunks")) or data.get("no_speech") is True
     except (ValueError, OSError):   # ValueError covers JSON and Unicode decode errors
         print(f"  [!] {json_filename} is corrupt — re-transcribing")
         try:
@@ -249,6 +251,7 @@ for idx, audio in enumerate(audios, 1):
 
         chunks = []
         text_parts = []
+        malformed = 0
         for seg in segments:
             try:
                 chunk = {
@@ -263,12 +266,16 @@ for idx, audio in enumerate(audios, 1):
                     text_parts.append(chunk["text"])
             except (ValueError, AttributeError, TypeError) as e:
                 print(f"  [WARNING] Skipped malformed segment: {e}")
+                malformed += 1
                 continue
 
-        if not chunks:
+        if not chunks and malformed:
             print("  [!] No valid chunks extracted")
             results["failed"] += 1
             continue
+        # Nothing malformed and nothing said: the recording has no speech. That
+        # is an answer, not a failure, so it is recorded and never redone.
+        no_speech = not chunks
 
         # Save with error handling
         try:
@@ -279,7 +286,8 @@ for idx, audio in enumerate(audios, 1):
                 json.dump({
                     "chunks": chunks,
                     "text": " ".join(text_parts),
-                    "language": getattr(info, "language", "en") or "en"
+                    "language": getattr(info, "language", "en") or "en",
+                    **({"no_speech": True} if no_speech else {}),
                 }, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
@@ -289,7 +297,10 @@ for idx, audio in enumerate(audios, 1):
             spoken = getattr(info, "duration", 0) or 0
             audio_seconds += spoken
             speed = f", {spoken / elapsed:.0f}x realtime" if elapsed > 0 and spoken else ""
-            print(f"  [+] Created {len(chunks)} chunks ({elapsed:.1f}s{speed})", flush=True)
+            if no_speech:
+                print(f"  [=] No speech detected ({elapsed:.1f}s); recorded an empty transcript", flush=True)
+            else:
+                print(f"  [+] Created {len(chunks)} chunks ({elapsed:.1f}s{speed})", flush=True)
             results["success"] += 1
         except Exception as e:
             print(f"  [!] Failed to save JSON: {e}")

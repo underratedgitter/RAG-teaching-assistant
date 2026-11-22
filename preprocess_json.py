@@ -356,6 +356,10 @@ for json_idx, json_file in enumerate(jsons, 1):
             content = json.load(f)
 
         raw_chunks = content['chunks']
+        if not raw_chunks:
+            # A recording with no speech: finished, with nothing to index.
+            print(f"\n[=] [{json_idx}/{len(jsons)}] {json_file}: no speech, nothing to index")
+            continue
         # Merge small segments into bigger overlapping chunks
         merged_chunks = merge_segments(raw_chunks, target_words=150, overlap_words=30)
         chunk_count = len(merged_chunks)
