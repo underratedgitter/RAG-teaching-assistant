@@ -290,6 +290,10 @@ def test_actual_conversion_jobs_do_not_share_outputs(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(Path(args[args.index('-i') + 1]).read_bytes())
         return SimpleNamespace(returncode=0, stderr=b'')
     monkeypatch.setattr(subprocess, 'run', fake_ffmpeg)
+    # ffmpeg is faked above, so the preflight must not depend on a real one being installed (CI has none).
+    import shutil
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, 'which', lambda name, *a, **k: '/usr/bin/ffmpeg' if name == 'ffmpeg' else real_which(name, *a, **k))
     runpy.run_path(str(ROOT / 'video_to_mp3.py'))
     outputs = list((tmp_path / 'audios').glob('*.mp3'))
     assert len(outputs) == 2
