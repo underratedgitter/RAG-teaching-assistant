@@ -142,13 +142,14 @@ def test_cuda_exhausted_falls_back_to_cpu(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": StubCudaFailsCpuSucceeds,
         },
     )
@@ -172,16 +173,123 @@ def test_cuda_success_makes_no_cpu_attempt(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 1)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": StubCudaSucceeds,
         },
     )
     model = ns["load_model"]()
     assert model.device == "cuda"
     assert "cpu" not in StubCudaSucceeds.devices_attempted
+
+
+# ── fetching the Whisper weights once ──────────────────────────────────────
+
+def _model_loader(monkeypatch, download, whisper):
+    monkeypatch.delenv("WHISPER_DEVICE", raising=False)
+    monkeypatch.delenv("WHISPER_MODEL", raising=False)
+    return load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model", "resolve_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "ctranslate2": type("ct", (), {
+                "get_cuda_device_count": staticmethod(lambda: 0)}),
+            "WhisperModel": whisper,
+            "download_model": download,
+        },
+    )
+
+
+def test_an_offline_first_run_says_the_weights_need_a_download(monkeypatch):
+    """One clear message, and no load attempt for every size and precision."""
+    downloads = []
+    loads = []
+
+    def offline(name, local_files_only=False, **kwargs):
+        downloads.append((name, local_files_only))
+        raise OSError("Cannot reach huggingface.co")
+
+    class Whisper:
+        def __init__(self, *args, **kwargs):
+            loads.append(args)
+
+    with pytest.raises(SystemExit) as stopped:
+        _model_loader(monkeypatch, offline, Whisper)["load_model"]()
+
+    message = str(stopped.value)
+    assert "download" in message and "internet" in message and "'base'" in message
+    assert "WHISPER_MODEL" in message
+    assert loads == []
+    # The first size is looked up in the cache, then fetched, once: not per
+    # precision. After that failure the smaller sizes are only looked up.
+    assert downloads == [("base", True), ("base", False), ("small", True), ("tiny", True)]
+
+
+def test_cached_weights_load_without_touching_the_network(monkeypatch):
+    downloads = []
+
+    def cached(name, local_files_only=False, **kwargs):
+        downloads.append(local_files_only)
+        if not local_files_only:
+            raise AssertionError("the network was used for weights that are cached")
+        return f"/cache/{name}"
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            self.path = path
+
+    model = _model_loader(monkeypatch, cached, Whisper)["load_model"]()
+
+    assert model.path == "/cache/base"
+    assert downloads == [True]
+
+
+def test_the_weights_are_resolved_once_across_precisions(monkeypatch):
+    downloads = []
+    tried = []
+
+    def fetch(name, local_files_only=False, **kwargs):
+        downloads.append(name)
+        return f"/cache/{name}"
+
+    class Whisper:
+        def __init__(self, path, compute_type, **kwargs):
+            tried.append(compute_type)
+            if compute_type == "int8":
+                raise RuntimeError("no int8 kernel")
+
+    _model_loader(monkeypatch, fetch, Whisper)["load_model"]()
+
+    assert tried == ["int8", "float32"]
+    assert downloads == ["base"]
+
+
+def test_a_local_model_folder_is_used_as_it_is(monkeypatch, tmp_path):
+    def fetch(*args, **kwargs):
+        raise AssertionError("a folder on disk needs no download")
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            self.path = path
+
+    monkeypatch.setenv("WHISPER_MODEL", str(tmp_path))
+    ns = load(
+        "mp3_to_json.py",
+        functions=["pick_device", "load_model", "resolve_model"],
+        constants=WHISPER_CONFIG,
+        namespace={
+            "os": os,
+            "ctranslate2": type("ct", (), {"get_cuda_device_count": staticmethod(lambda: 0)}),
+            "WhisperModel": Whisper,
+            "download_model": fetch,
+        },
+    )
+    assert ns["load_model"]().path == str(tmp_path)

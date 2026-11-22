@@ -81,6 +81,9 @@ class WhisperModel:
 """
 
 
+FAKE_WHISPER_UTILS = "def download_model(name, **kwargs):\n    return name\n"
+
+
 class _FakeOllama(BaseHTTPRequestHandler):
     hang = threading.Event()      # set: hold every request until released
     drop = threading.Event()      # set: close the connection without answering
@@ -132,7 +135,9 @@ def workspace(tmp_path):
     ffmpeg.write_text(FAKE_FFMPEG.format(python=sys.executable))
     ffmpeg.chmod(ffmpeg.stat().st_mode | stat.S_IEXEC)
     (stubs / "ctranslate2.py").write_text(FAKE_CTRANSLATE2, encoding="utf-8")
-    (stubs / "faster_whisper.py").write_text(FAKE_WHISPER, encoding="utf-8")
+    (stubs / "faster_whisper").mkdir()
+    (stubs / "faster_whisper" / "__init__.py").write_text(FAKE_WHISPER, encoding="utf-8")
+    (stubs / "faster_whisper" / "utils.py").write_text(FAKE_WHISPER_UTILS, encoding="utf-8")
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllama)
     threading.Thread(target=server.serve_forever, daemon=True).start()

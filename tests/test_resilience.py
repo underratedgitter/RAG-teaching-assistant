@@ -449,13 +449,14 @@ def test_model_load_failure_is_reported_not_raised(monkeypatch):
 
     ns = load(
         "mp3_to_json.py",
-        functions=["pick_device", "load_model"],
+        functions=["pick_device", "load_model", "resolve_model"],
         constants=WHISPER_CONFIG,
         namespace={
             "os": os,
             "json": json,
             "ctranslate2": type("ct", (), {
                 "get_cuda_device_count": staticmethod(lambda: 0)}),
+            "download_model": lambda name, **kwargs: name,
             "WhisperModel": AlwaysFailingWhisperModel,
         },
     )
@@ -531,8 +532,12 @@ def _run_transcription(monkeypatch):
     fake_ctranslate2.get_cuda_device_count = lambda: 0
     fake_faster_whisper = types.ModuleType("faster_whisper")
     fake_faster_whisper.WhisperModel = _StubWhisperModel
+    fake_utils = types.ModuleType("faster_whisper.utils")
+    fake_utils.download_model = lambda name, **kwargs: name
+    fake_faster_whisper.utils = fake_utils
     monkeypatch.setitem(sys.modules, "ctranslate2", fake_ctranslate2)
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_faster_whisper)
+    monkeypatch.setitem(sys.modules, "faster_whisper.utils", fake_utils)
     _StubWhisperModel.instances = []
 
     try:

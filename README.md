@@ -2,7 +2,7 @@
 
 Drop lecture videos in. Ask a question. Get an answer grounded in what was actually said, with the timestamp where it was said.
 
-Runs entirely on your machine — Whisper for transcription, Ollama for embeddings and generation. No API key, no upload, nothing leaves the laptop.
+Runs entirely on your machine — Whisper for transcription, Ollama for embeddings and generation. No API key, no upload, nothing leaves the laptop. Two things are downloaded once and then cached: the Whisper weights (from the Hugging Face Hub, on the first transcription) and the Ollama models (`ollama pull`). Until both are on disk the first run needs an internet connection; after that it works offline.
 
 Transcription is the slow stage, so it runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) rather than the reference PyTorch implementation: same weights, roughly **18–27× realtime on a plain CPU**, and no 2 GB torch install to sit through.
 
@@ -46,6 +46,8 @@ transcripts are preserved in `audios/.ambiguous/` rather than indexed twice.
 A video you delete from `videos/` leaves the library the next time you run **Process Videos**: its audio, source record and transcript are moved to `audios/.orphaned/` (kept, not deleted), so it stops being transcribed and indexed, and `preprocess_json.py` drops the cached embeddings of any transcript that is gone.
 
 **2. `mp3_to_json.py`** — transcribes with faster-whisper, keeping each segment's `start` and `end` timestamps. Picks CUDA when it's available and falls back to CPU, and picks its precision to match: `float16` on a GPU, `int8` on a CPU. Voice-activity detection drops silence before it reaches the model, so the pauses in a lecture cost nothing. A recording with no speech at all is written as an empty transcript marked `no_speech`, counted as done and skipped on later runs rather than re-transcribed and reported as a failure. Decoding is greedy rather than beam search — on lecture speech the transcript is the same and the decode is several times quicker.
+
+The Whisper weights are looked up in the Hugging Face cache first and fetched only if they are missing, once per model rather than once per precision. With no network and nothing cached, the stage stops with a message saying the first transcription needs an internet connection (or a `WHISPER_MODEL` folder that already holds a model). `python preflight.py` and the dashboard's startup checks report the same thing before you start, and only when the weights are neither cached nor downloadable.
 
 If the `small` model won't load it degrades to `base`, then `tiny`, and each size falls back through lower precisions first, rather than failing outright — a machine with less VRAM gets a worse transcript instead of no transcript.
 
@@ -151,6 +153,7 @@ the command that fixes it.
 |---|---|---|
 | `ffmpeg` on `PATH` | `brew install ffmpeg`, `winget install ffmpeg` or `sudo apt install ffmpeg` | Process Videos |
 | `faster-whisper` imports | `python -m pip install -r requirements.txt` | Process Videos |
+| Whisper weights are cached, or the Hugging Face Hub is reachable to fetch them | connect once, or set `WHISPER_MODEL` to a downloaded model folder | Process Videos |
 | Ollama answers at `OLLAMA_URL` | `ollama serve` | Process Videos and Ask |
 | `EMBED_MODEL` is pulled | `ollama pull nomic-embed-text` (or your model) | Process Videos and Ask |
 | `ANSWER_MODEL` is pulled | `ollama pull qwen2.5:1.5b` (or your model) | Ask |
@@ -193,7 +196,7 @@ half-finished transcript that later runs would mistake for a complete one.
 
 ## Why local
 
-The obvious build here is Whisper API plus a hosted embedding model, and it would be less code. This runs offline instead because lecture recordings are often not yours to upload, an always-on API key is a running cost for something used in bursts, and the whole pipeline still works on a train.
+The obvious build here is Whisper API plus a hosted embedding model, and it would be less code. This runs offline instead because lecture recordings are often not yours to upload, an always-on API key is a running cost for something used in bursts, and once the Whisper weights and Ollama models have been downloaded the whole pipeline still works on a train.
 
 The trade is quality: `qwen2.5:1.5b` is a small model, and answers are correspondingly plainer than a frontier model would give. Retrieval quality is doing most of the work, which is where the chunking and overlap earn their place.
 

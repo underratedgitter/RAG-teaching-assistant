@@ -19,6 +19,7 @@ import json
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -49,6 +50,10 @@ DEFAULTS = {
 CHECK_TIMEOUT = 3
 # Importing faster-whisper loads CTranslate2, which can take a while on a cold disk.
 IMPORT_TIMEOUT = 60
+
+# Exit status of the child that looks for the Whisper weights in the cache,
+# when they are not there.
+NOT_CACHED = 3
 
 _FFMPEG_INSTALL = {"darwin": "brew install ffmpeg", "win32": "winget install ffmpeg"}
 
@@ -204,6 +209,70 @@ def check_whisper(isolated=False):
     )]
 
 
+# Finds the weights mp3_to_json.py will load, in a child process so that
+# CTranslate2 is never loaded into the caller. Prints the model's name; exits
+# NOT_CACHED when its files are not in the Hugging Face cache. The default
+# size follows mp3_to_json.py: small on CUDA, otherwise base.
+_WHISPER_PROBE = f"""
+import os, sys
+import ctranslate2
+from faster_whisper.utils import download_model
+name = os.environ.get("WHISPER_MODEL")
+if not name:
+    forced = os.environ.get("WHISPER_DEVICE")
+    cuda = forced == "cuda" if forced else ctranslate2.get_cuda_device_count() > 0
+    name = "small" if cuda else "base"
+print(name)
+if not os.path.isdir(name):
+    try:
+        download_model(name, local_files_only=True)
+    except Exception:
+        sys.exit({NOT_CACHED})
+"""
+
+
+def _hub_reachable():
+    """Whether the Hugging Face Hub, where Whisper weights come from, answers."""
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        return False
+    parts = urlparse(os.environ.get("HF_ENDPOINT") or "https://huggingface.co")
+    try:
+        with socket.create_connection(
+            (parts.hostname or "huggingface.co", parts.port or 443), timeout=CHECK_TIMEOUT
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def check_whisper_model():
+    """Whether the Whisper weights are on disk, or can still be downloaded.
+
+    The first transcription downloads them, so a missing model is only a
+    problem when the Hub cannot be reached either. Anything that stops the
+    probe running (a broken install) is check_whisper's to report.
+    """
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", _WHISPER_PROBE],
+            capture_output=True, text=True, errors="replace", timeout=IMPORT_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if done.returncode != NOT_CACHED or _hub_reachable():
+        return []
+    name = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else "Whisper"
+    return [Problem(
+        "whisper model",
+        f"The Whisper model '{name}' is not downloaded and the Hugging Face Hub "
+        "cannot be reached, so the first transcription cannot fetch it.",
+        "connect to the internet and run Process Videos once (the weights are then "
+        f"kept and need no network), or download '{name}' elsewhere and set "
+        "WHISPER_MODEL to its folder",
+        (PROCESS,),
+    )]
+
+
 def _is_installed(model, installed):
     # "name" means "name:latest" to Ollama.
     return model in installed or (":" not in model and f"{model}:latest" in installed)
@@ -270,7 +339,8 @@ def check_ollama(url, embed_model, answer_model=None):
 
 def run_checks(url, embed_model, answer_model):
     """Every check the dashboard needs, in the order a user would fix them."""
-    return (check_ffmpeg() + check_whisper(isolated=True)
+    whisper = check_whisper(isolated=True)
+    return (check_ffmpeg() + whisper + ([] if whisper else check_whisper_model())
             + check_ollama(url, embed_model, answer_model))
 
 
@@ -373,7 +443,8 @@ def main():
     models = list(dict.fromkeys([embed_model, answer_model]))
     have_ollama_cli = shutil.which("ollama") is not None
 
-    local = check_ffmpeg() + check_whisper(isolated=True)
+    whisper = check_whisper(isolated=True)
+    local = check_ffmpeg() + whisper + ([] if whisper else check_whisper_model())
     remote = check_ollama(url, embed_model, answer_model)
     pullable = [problem.model for problem in remote if problem.model]
     if pullable and have_ollama_cli and _wants_pull():
@@ -382,7 +453,8 @@ def main():
 
     problems = local + remote
     by_piece = {problem.piece: problem for problem in problems}
-    for piece in ["ffmpeg", "faster-whisper", "ollama"] + [f"model {m}" for m in models]:
+    for piece in (["ffmpeg", "faster-whisper", "whisper model", "ollama"]
+                  + [f"model {m}" for m in models]):
         problem = by_piece.get(piece)
         if problem is None:
             print(f"ok       {'Ollama at ' + url if piece == 'ollama' else piece}")

@@ -162,6 +162,92 @@ def test_an_isolated_check_that_succeeds_reports_nothing(monkeypatch):
     assert preflight.check_whisper(isolated=True) == []
 
 
+# ── the Whisper weights ─────────────────────────────────────────────────────
+
+def _probe(monkeypatch, code, stdout="base\n"):
+    monkeypatch.setattr(
+        preflight.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, code, stdout, ""))
+
+
+def test_weights_that_are_cached_are_fine(monkeypatch):
+    _probe(monkeypatch, 0)
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: False)
+    assert preflight.check_whisper_model() == []
+
+
+def test_weights_that_are_not_cached_but_can_be_downloaded_are_fine(monkeypatch):
+    _probe(monkeypatch, preflight.NOT_CACHED)
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: True)
+    assert preflight.check_whisper_model() == []
+
+
+def test_weights_that_are_neither_cached_nor_downloadable_block_processing(monkeypatch):
+    _probe(monkeypatch, preflight.NOT_CACHED, "small\n")
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: False)
+    [problem] = preflight.check_whisper_model()
+    assert "'small'" in problem.message and "not downloaded" in problem.message
+    assert "internet" in problem.fix and "WHISPER_MODEL" in problem.fix
+    assert problem.blocks == (PROCESS,)
+
+
+def test_a_probe_that_cannot_run_is_left_to_the_faster_whisper_check(monkeypatch):
+    _probe(monkeypatch, 1, "")
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: False)
+    assert preflight.check_whisper_model() == []
+
+
+def test_the_probe_finds_no_problem_with_a_local_model_folder(monkeypatch, tmp_path):
+    pytest.importorskip("faster_whisper")
+    monkeypatch.setenv("WHISPER_MODEL", str(tmp_path))
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: False)
+    assert preflight.check_whisper_model() == []
+
+
+def test_the_probe_sees_that_a_model_is_not_cached(monkeypatch, tmp_path):
+    pytest.importorskip("faster_whisper")
+    monkeypatch.setenv("WHISPER_MODEL", "Systran/faster-whisper-not-a-real-model")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(preflight, "_hub_reachable", lambda: False)
+    [problem] = preflight.check_whisper_model()
+    assert "Systran/faster-whisper-not-a-real-model" in problem.message
+
+
+def test_the_hub_is_unreachable_when_offline_mode_is_set(monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert preflight._hub_reachable() is False
+
+
+def test_the_hub_is_checked_at_the_configured_endpoint(monkeypatch):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setenv("HF_ENDPOINT", "https://mirror.example:8443")
+    asked = []
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def connect(address, timeout=None):
+        asked.append(address)
+        return _Connection()
+
+    monkeypatch.setattr(preflight.socket, "create_connection", connect)
+    assert preflight._hub_reachable() is True
+    assert asked == [("mirror.example", 8443)]
+
+
+def test_the_dashboard_checks_include_the_weights(monkeypatch):
+    monkeypatch.setattr(preflight, "check_ffmpeg", lambda: [])
+    monkeypatch.setattr(preflight, "check_whisper", lambda isolated=False: [])
+    monkeypatch.setattr(preflight, "check_ollama", lambda *args: [])
+    problem = preflight.Problem("whisper model", "x", "y", (PROCESS,))
+    monkeypatch.setattr(preflight, "check_whisper_model", lambda: [problem])
+    assert preflight.run_checks("http://x", "m", "n") == [problem]
+
+
 # ── ollama and its models ───────────────────────────────────────────────────
 
 def test_ollama_with_both_models_is_fine(monkeypatch):
@@ -401,6 +487,7 @@ def tools(tmp_path, monkeypatch):
     for var in ("OLLAMA_URL", "EMBED_MODEL", "ANSWER_MODEL", "RAG_AUTO_PULL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(preflight, "check_whisper", lambda isolated=False: [])
+    monkeypatch.setattr(preflight, "check_whisper_model", lambda: [])
 
     def install(name, script="exit 0"):
         path = tmp_path / name

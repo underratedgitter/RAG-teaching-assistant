@@ -10,6 +10,7 @@ preflight.require(whisper=True)
 
 import ctranslate2
 from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
 
 # A console that cannot encode a file name must not take a stage down: print
 # the name with escapes instead of raising UnicodeEncodeError mid-run.
@@ -73,13 +74,51 @@ _cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "0")) or (os.cpu_count(
 model = None
 
 
+def resolve_model(name, allow_download=True):
+    """The local folder holding a Whisper model's weights.
+
+    Looks in the cache first, so a model that is already downloaded loads with
+    no network at all, and fetches it only when it is not there (and
+    allow_download says so). Done once per model rather than once per
+    precision: a failed download is the same failure however the weights
+    would have been loaded.
+    """
+    if os.path.isdir(name):
+        return name
+    try:
+        return download_model(name, local_files_only=True)
+    except Exception:
+        if not allow_download:
+            raise
+        return download_model(name)
+
+
 def load_model():
     """Load the Whisper model, falling back across precision and hardware."""
+    weights = {}
+    unavailable = []
+
+    def weights_of(name):
+        if name not in weights:
+            try:
+                # After one failed download the smaller models are tried from
+                # the cache only: the next download would wait out the same
+                # network failure.
+                weights[name] = resolve_model(name, allow_download=not unavailable)
+            except Exception as e:
+                print(f"[WARNING] Could not get the '{name}' model: {e}")
+                unavailable.append((name, e))
+                weights[name] = None
+        return weights[name]
+
     for _name in _model_ladder:
+        path = weights_of(_name)
+        if path is None:
+            continue
         for _ct in _compute_ladder:
             try:
                 loaded = WhisperModel(
-                    _name,
+                    path,
                     device=device,
                     compute_type=_ct,
                     cpu_threads=_cpu_threads if device == "cpu" else 0,
@@ -92,10 +131,13 @@ def load_model():
     if device == "cuda":
         print("[WARNING] CUDA model loading failed — falling back to CPU")
         for _name in _model_ladder:
+            path = weights_of(_name)
+            if path is None:
+                continue
             for _ct in ("int8", "float32"):
                 try:
                     loaded = WhisperModel(
-                        _name,
+                        path,
                         device="cpu",
                         compute_type=_ct,
                         cpu_threads=_cpu_threads,
@@ -105,6 +147,14 @@ def load_model():
                 except Exception as e:
                     print(f"[WARNING] Failed to load '{_name}' model as {_ct}: {e}")
 
+    if len(unavailable) == len(_model_ladder):
+        raise SystemExit(
+            f"Could not download the Whisper model '{_preferred}' ({unavailable[0][1]}). "
+            "The first transcription downloads the weights and needs an internet "
+            "connection; after that they are cached and nothing more is fetched. "
+            "Connect and run this again, or set WHISPER_MODEL to a folder that "
+            "already holds a downloaded model."
+        )
     raise SystemExit(
         "Could not load any Whisper model. Check the install and free disk space."
     )
