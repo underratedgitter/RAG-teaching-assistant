@@ -136,6 +136,15 @@ NUM_PREDICT = int(os.environ.get("NUM_PREDICT", "300"))
 
 GENERATION_OPTIONS = {"num_predict": NUM_PREDICT}
 
+# Ollama silently drops the start of a prompt that does not fit its context
+# window, so the window is sized to the prompt and the excerpts are capped to
+# fit MAX_CONTEXT_TOKENS (context window, in tokens, that a request may use).
+CHARS_PER_TOKEN = 3
+CONTEXT_STEP = 4096              # num_ctx is asked for in multiples of this
+MAX_CONTEXT_TOKENS = 8192        # prompt plus answer
+EXCERPT_TAG_TOKENS = 40          # the tag line around each excerpt
+PROMPT_OVERHEAD_TOKENS = 200     # the framing lines and the question's tags
+
 
 def _parse_progress(line):
     """(done, total) from a "PROGRESS done/total" line, else None."""
@@ -173,6 +182,54 @@ def _wait_for_group_exit(process, timeout):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+def _estimate_tokens(text):
+    """A rough token count for text, erring on the high side.
+
+    Three characters a token over-counts English a little, which is the safe
+    direction: the context window is requested a little large, not small.
+    """
+    return len(text) // CHARS_PER_TOKEN + 1
+
+
+def _excerpt_tokens(row):
+    """Tokens one excerpt costs in the prompt: its text and its tag line."""
+    return _estimate_tokens(str(row.get("text", ""))) + EXCERPT_TAG_TOKENS
+
+
+def _excerpt_budget(question, system=SYSTEM_PROMPT):
+    """Tokens left for excerpts once the instructions, question and answer are paid for."""
+    used = (_estimate_tokens(system) + _estimate_tokens(str(question))
+            + NUM_PREDICT + PROMPT_OVERHEAD_TOKENS)
+    return max(0, MAX_CONTEXT_TOKENS - used)
+
+
+def _fit_rows(rows, budget):
+    """The best-ranked rows that fit in the budget, in the order given.
+
+    The best row is always kept, however large, so an answer is never built
+    from nothing.
+    """
+    kept, used = [], 0
+    for row in rows:
+        cost = _excerpt_tokens(row)
+        if kept and used + cost > budget:
+            break
+        kept.append(row)
+        used += cost
+    return kept
+
+
+def _num_ctx(prompt_tokens):
+    """The context window to ask Ollama for: prompt plus answer, rounded up.
+
+    Ollama's default window is small, and a prompt that does not fit loses its
+    oldest text without any error. Rounding to a step keeps the requested
+    size, and so Ollama's loaded model, the same from question to question.
+    """
+    needed = prompt_tokens + NUM_PREDICT
+    return max(CONTEXT_STEP, -(-needed // CONTEXT_STEP) * CONTEXT_STEP)
 
 
 def _is_video(name):
@@ -233,6 +290,10 @@ def format_sources(rows, limit=3):
 def build_prompt(rows, question, tag):
     """Build the user prompt: tagged excerpts, then the tagged question.
 
+    `rows` are best match first. They are written worst first, so the best
+    excerpt sits next to the question, where a small model attends most and
+    where truncation reaches last.
+
     The tag is random per request, so the system prompt cannot name it in
     advance and pasted content cannot guess the delimiter to fake a closing
     tag.
@@ -241,7 +302,7 @@ def build_prompt(rows, question, tag):
         f"Excerpts are delimited by excerpt-{tag} tags; "
         f"the question is delimited by question-{tag}."
     ]
-    for row in rows:
+    for row in reversed(rows):
         mins_s, secs_s = _time_parts(row.get("start"))
         mins_e, secs_e = _time_parts(row.get("end"))
         parts.append(
@@ -547,7 +608,8 @@ class RAGDashboard:
                     json={"model": EMBED_MODEL, "input": ["warmup"]}, timeout=OLLAMA_TIMEOUT)
                 session.post(f"{OLLAMA_URL}/api/generate",
                     json={"model": ANSWER_MODEL, "prompt": "hi", "stream": False,
-                          "options": {"num_predict": 1}}, timeout=OLLAMA_TIMEOUT)
+                          "options": {"num_predict": 1, "num_ctx": CONTEXT_STEP}},
+                    timeout=OLLAMA_TIMEOUT)
             self.log_safe("✓ Ollama models warmed up - ready for queries.")
         except Exception as e:
             self.log_safe(f"⚠ Model warm-up failed: {preflight.describe_ollama_error(e, ANSWER_MODEL)}")
@@ -1047,7 +1109,7 @@ class RAGDashboard:
             # The tag is random per request, so the system prompt cannot know
             # it in advance and pasted content cannot close its own block.
             tag = secrets.token_hex(8)
-            rows = chunks.to_dict("records")
+            rows = _fit_rows(chunks.to_dict("records"), _excerpt_budget(question))
             prompt = build_prompt(rows, question, tag)
 
             r = session.post(f"{OLLAMA_URL}/api/generate",
@@ -1056,7 +1118,12 @@ class RAGDashboard:
                     "system": SYSTEM_PROMPT,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {**GENERATION_OPTIONS, "temperature": 0.2, "top_p": 0.9}
+                    "options": {
+                        **GENERATION_OPTIONS,
+                        "num_ctx": _num_ctx(_estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(prompt)),
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                    }
                 },
                 timeout=OLLAMA_TIMEOUT)
             r.raise_for_status()

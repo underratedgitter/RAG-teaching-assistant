@@ -26,6 +26,7 @@ _POLL_STOPPER = "_stop_polling"
 
 _FUNCTIONS = {
     "_clean_field", "_neutralise_tags", "_time_parts", "build_prompt", "format_sources",
+    "_estimate_tokens", "_excerpt_tokens", "_excerpt_budget", "_fit_rows", "_num_ctx",
 }
 _METHODS = {
     "log",
@@ -49,6 +50,12 @@ _CONSTANTS = {
     "QUERY_PREFIX",
     "SYSTEM_PROMPT",
     "GENERATION_OPTIONS",
+    "NUM_PREDICT",
+    "CHARS_PER_TOKEN",
+    "CONTEXT_STEP",
+    "EXCERPT_TAG_TOKENS",
+    "MAX_CONTEXT_TOKENS",
+    "PROMPT_OVERHEAD_TOKENS",
     "_TAG_RE",
     "UI_POLL_MS",
     "TERMINAL_MAX_LINES",

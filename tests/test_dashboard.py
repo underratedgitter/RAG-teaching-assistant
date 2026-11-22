@@ -41,6 +41,11 @@ _FUNCTIONS = {
     "_time_parts",
     "build_prompt",
     "format_sources",
+    "_estimate_tokens",
+    "_excerpt_tokens",
+    "_excerpt_budget",
+    "_fit_rows",
+    "_num_ctx",
 }
 _METHODS = {
     "load_embeddings",
@@ -74,6 +79,11 @@ _CONSTANTS = {
     "VIDEO_EXTENSIONS",
     "GENERATION_OPTIONS",
     "NUM_PREDICT",
+    "CHARS_PER_TOKEN",
+    "CONTEXT_STEP",
+    "EXCERPT_TAG_TOKENS",
+    "MAX_CONTEXT_TOKENS",
+    "PROMPT_OVERHEAD_TOKENS",
     "_TAG_RE",
     "_PROGRESS_RE",
 }
@@ -1246,3 +1256,91 @@ def test_the_answer_length_can_be_set_from_the_environment(monkeypatch):
     ns["_answer"](app, "What is this?")
 
     assert _request(session, "/api/generate")["json"]["options"]["num_predict"] == 700
+
+
+# ── the context window and the prompt budget ───────────────────────────────
+
+def _prompt_of(session):
+    return _request(session, "/api/generate")["json"]["prompt"]
+
+
+def _options_of(session):
+    return _request(session, "/api/generate")["json"]["options"]
+
+
+def test_a_short_prompt_asks_for_the_smallest_context_window(ns):
+    df, matrix = _corpus([0.9, 0.8])
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _options_of(session)["num_ctx"] == 4096
+
+
+def test_the_context_window_covers_the_prompt_and_the_answer(monkeypatch):
+    monkeypatch.setenv("TOP_K", "30")
+    ns = _namespace()
+    sims = [0.9 - 0.01 * i for i in range(30)]
+    df, matrix = _corpus(sims)
+    df["text"] = [f"chunk {i} " + "word " * 300 for i in range(30)]
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    request = _request(session, "/api/generate")["json"]
+    needed = (ns["_estimate_tokens"](request["system"]) + ns["_estimate_tokens"](request["prompt"])
+              + request["options"]["num_predict"])
+    num_ctx = request["options"]["num_ctx"]
+    assert num_ctx % 4096 == 0 and needed <= num_ctx <= 8192
+
+
+def test_excerpts_beyond_the_token_budget_are_left_out_best_first(monkeypatch):
+    monkeypatch.setenv("TOP_K", "30")
+    ns = _namespace()
+    sims = [0.9 - 0.01 * i for i in range(30)]
+    df, matrix = _corpus(sims)
+    df["text"] = [f"chunk {i} " + "word " * 300 for i in range(30)]
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    prompt = _prompt_of(session)
+    kept = prompt.count("<excerpt-")     # opening tags only; the closing ones start "</"
+    assert 3 < kept < 30
+    assert "chunk 0 " in prompt and f"chunk {kept - 1} " in prompt
+    assert f"chunk {kept} " not in prompt
+
+
+def test_the_sources_name_only_the_excerpts_that_were_sent(monkeypatch):
+    monkeypatch.setenv("TOP_K", "8")
+    ns = _namespace()
+    df, matrix = _corpus([0.9, 0.8, 0.7, 0.6])
+    df["text"] = [f"chunk {i} " + "word " * 3500 for i in range(4)]   # one fits, a second does not
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _prompt_of(session).count("<excerpt-") == 1
+    assert _shown(app).split("Sources: ")[1] == "Video 1 (Lecture 1) 0:00–0:30"
+
+
+def test_the_best_excerpt_is_sent_even_when_it_alone_is_over_the_budget(ns):
+    df, matrix = _corpus([0.9])
+    df["text"] = ["huge " * 20000]
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert _prompt_of(session).count("<excerpt-") == 1
+
+
+def test_the_best_excerpt_sits_nearest_the_question(ns):
+    df, matrix = _corpus([0.5, 0.9, 0.7])
+    app, session, _ = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    prompt = _prompt_of(session)
+    order = [prompt.index(f"chunk {i}") for i in (0, 2, 1)]
+    assert order == sorted(order)
+    assert prompt.rindex("chunk ") == prompt.index("chunk 1") < prompt.index("<question-")

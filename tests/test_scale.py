@@ -31,11 +31,13 @@ NEEDLE = 12_345
 _CONSTANTS = {
     "TOP_K", "SIMILARITY_THRESHOLD", "FALLBACK_K", "OLLAMA_URL", "EMBED_MODEL",
     "ANSWER_MODEL", "OLLAMA_TIMEOUT", "_USES_TASK_PREFIX", "DOCUMENT_PREFIX", "QUERY_PREFIX",
-    "SYSTEM_PROMPT", "GENERATION_OPTIONS", "_TAG_RE",
+    "SYSTEM_PROMPT", "GENERATION_OPTIONS", "NUM_PREDICT", "CHARS_PER_TOKEN", "CONTEXT_STEP",
+    "EXCERPT_TAG_TOKENS", "MAX_CONTEXT_TOKENS", "PROMPT_OVERHEAD_TOKENS", "_TAG_RE",
 }
 _FUNCTIONS = {
     "_matrix_matches_dataframe", "_clean_field", "_neutralise_tags", "_time_parts",
-    "build_prompt", "format_sources",
+    "build_prompt", "format_sources", "_estimate_tokens", "_excerpt_tokens", "_excerpt_budget",
+    "_fit_rows", "_num_ctx",
 }
 _METHODS = {"load_embeddings", "_prepare_matrix", "_answer"}
 
