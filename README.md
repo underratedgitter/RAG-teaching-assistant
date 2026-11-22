@@ -80,6 +80,8 @@ models get the raw text.
 
 **Processing from the dashboard.** **Process Videos** runs the three scripts in turn and then loads the index, so the status bar reads `Step N/4: … done/total files`. **Cancel** (enabled only while a run is going) stops the running stage and everything it started, such as the ffmpeg workers, with `SIGTERM` and a kill after 5 seconds, then deletes the `.partial` temp files they left and re-enables the buttons. Because every output is written to a temp file and renamed, a cancelled or killed stage never leaves a truncated file behind; finished work is kept and the next run resumes from it.
 
+If the saved index is refused at launch or after a run (for example it was built with another `EMBED_MODEL`, or its matrix is missing), the reason is written to the terminal pane and the "No Data" dialog, and a run whose index cannot be loaded ends with an error rather than "Processing complete".
+
 The corpus matrix is normalised once, in place, at load (float32, no second copy), so a question is a single matrix–vector product and allocates nothing the size of the corpus. A synthetic 50k-chunk, 768-dimension library (154 MB) loads in about a second and answers in roughly 10 ms.
 
 The model is instructed to answer **only** from the supplied excerpts, which is what keeps it honest about material it hasn't seen.

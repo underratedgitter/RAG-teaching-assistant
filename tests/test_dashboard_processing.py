@@ -89,6 +89,7 @@ def _app(ns, tmp_path, stages):
         audios_dir=str(tmp_path / "audios"),
         jsons_dir=str(tmp_path / "jsons"),
         df=None,
+        _index_problem=None,
         status_label=_Label(),
         process_btn=_Button(), ask_btn=_Button(), cancel_btn=_Button(),
         terminal=[],
@@ -386,4 +387,24 @@ def test_a_finished_run_is_not_reported_as_cancelled(tmp_path):
     _drain(app)
 
     assert app.status_label.statuses[-1] == "Done! 3 chunks indexed"
+    assert app._processing is False
+
+
+def test_a_run_whose_index_cannot_be_loaded_is_an_error_not_a_success(tmp_path):
+    ns = _namespace()
+    app = _app(ns, tmp_path, {"a.py": "print('ok')\n"})
+
+    def rejects():
+        app.df = None
+        app._index_problem = "the embedding matrix is missing"
+
+    app.load_embeddings = rejects
+    app._process()
+    _drain(app)
+
+    assert app.status_label.statuses[-1] == (
+        "Error: the index could not be loaded (the embedding matrix is missing)")
+    log = "\n".join(app.terminal)
+    assert "[ERROR] The index could not be loaded: the embedding matrix is missing" in log
+    assert "[SUCCESS]" not in log
     assert app._processing is False

@@ -1371,3 +1371,79 @@ def test_the_best_excerpt_sits_nearest_the_question(ns):
     order = [prompt.index(f"chunk {i}") for i in (0, 2, 1)]
     assert order == sorted(order)
     assert prompt.rindex("chunk ") == prompt.index("chunk 1") < prompt.index("<question-")
+
+
+# ── a rejected index says why ──────────────────────────────────────────────
+
+def _loader_app(tmp_path, ns):
+    return SimpleNamespace(base_dir=str(tmp_path), df=None, embedding_matrix=None,
+                           _index_problem="left over from an earlier load",
+                           _prepare_matrix=lambda: None)
+
+
+def test_a_rejected_corpus_records_the_reason(ns, tmp_path):
+    _write_corpus(tmp_path, model="some-other-model")
+    app = _loader_app(tmp_path, ns)
+
+    ns["load_embeddings"](app)
+
+    assert app.df is None
+    assert "some-other-model" in app._index_problem and "nomic-embed-text" in app._index_problem
+
+
+def test_a_missing_matrix_records_the_reason(ns, tmp_path):
+    _write_corpus(tmp_path)
+    (tmp_path / "embedding_matrix.meta.json").write_text(
+        json.dumps({"corpus_id": "corpus", "rows": 1, "model": "nomic-embed-text"}))
+    app = _loader_app(tmp_path, ns)
+
+    ns["load_embeddings"](app)
+
+    assert app._index_problem == "the embedding matrix is missing"
+
+
+def test_having_no_corpus_yet_is_not_a_problem(ns, tmp_path):
+    app = _loader_app(tmp_path, ns)
+
+    ns["load_embeddings"](app)
+
+    assert app._index_problem is None
+
+
+def test_a_good_load_clears_an_earlier_problem(ns, tmp_path):
+    _write_corpus(tmp_path)
+    (tmp_path / "embedding_matrix.meta.json").write_text(
+        json.dumps({"corpus_id": "corpus", "rows": 1, "model": "nomic-embed-text"}))
+    np.save(tmp_path / "embedding_matrix.npy", np.array([[1.0, 0.0]], dtype=np.float32))
+    app = _loader_app(tmp_path, ns)
+
+    ns["load_embeddings"](app)
+
+    assert app.df is not None and app._index_problem is None
+
+
+def test_the_no_data_dialog_gives_the_reason_the_index_was_not_loaded(ns):
+    warnings = []
+    ns["messagebox"].showwarning = lambda title, message: warnings.append((title, message))
+    app = _busy_app(ns)
+    app.df = None
+    app._index_problem = "the embedding matrix is missing"
+
+    ns["ask_question"](app)
+
+    [(title, message)] = warnings
+    assert title == "No Data"
+    assert message.startswith("Process videos first!")
+    assert "the embedding matrix is missing" in message
+
+
+def test_the_no_data_dialog_stays_short_when_nothing_was_rejected(ns):
+    warnings = []
+    ns["messagebox"].showwarning = lambda title, message: warnings.append((title, message))
+    app = _busy_app(ns)
+    app.df = None
+    app._index_problem = None
+
+    ns["ask_question"](app)
+
+    assert warnings == [("No Data", "Process videos first!")]

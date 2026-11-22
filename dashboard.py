@@ -365,6 +365,9 @@ class RAGDashboard:
         # never meets a missing attribute.
         self.df = None
         self.embedding_matrix = None
+        # Why the saved index was refused, or None. Set by load_embeddings so
+        # the window can say so; the terminal line it prints is easy to miss.
+        self._index_problem = None
         # Read and written on the Tk thread only. A question and a
         # processing run never overlap, so an answer cannot read a corpus
         # that is being replaced underneath it.
@@ -403,6 +406,9 @@ class RAGDashboard:
             self.load_embeddings()
 
             self.create_ui()
+            if self._index_problem:
+                self.log(f"[WARNING] The saved index was not loaded: {self._index_problem}. "
+                         "Click 'Process Videos' to rebuild it.")
 
             threading.Thread(target=self._startup, daemon=True).start()
 
@@ -708,10 +714,13 @@ class RAGDashboard:
         matrix_path = os.path.join(self.base_dir, "embedding_matrix.npy")
         meta_path = os.path.join(self.base_dir, "embedding_matrix.meta.json")
 
+        self._index_problem = None
+
         def reject(reason):
             """Refuse a corpus we cannot trust, leaving no half-loaded state."""
             self.df = None
             self.embedding_matrix = None
+            self._index_problem = reason
             print(f"[WARNING] {reason}; ignoring it so Process Videos can rebuild.")
 
         try:
@@ -1008,7 +1017,13 @@ class RAGDashboard:
             self._status(f"Step {STAGE_COUNT}/{STAGE_COUNT}: Loading the index...")
             self.load_embeddings()
             chunks = len(self.df) if self.df is not None else 0
-            if incomplete:
+            if self.df is None:
+                # The stages succeeded but their output was refused: there is
+                # nothing to ask questions of, whatever the stages reported.
+                reason = self._index_problem or "no index was written"
+                self._status(f"Error: the index could not be loaded ({reason})")
+                self.log_safe(f"\n[ERROR] The index could not be loaded: {reason}.")
+            elif incomplete:
                 problems = ", ".join(incomplete)
                 self._status(f"{chunks} chunks indexed, with failures in {problems} (see terminal)")
                 self.log_safe(f"\n[WARNING] Finished with failures in {problems}. {chunks} chunks indexed.")
@@ -1061,7 +1076,10 @@ class RAGDashboard:
             self.response_text.insert("1.0", "Cannot answer yet:\n" + preflight.format_problems(missing))
             return
         if self.df is None:
-            messagebox.showwarning("No Data", "Process videos first!")
+            message = "Process videos first!"
+            if self._index_problem:
+                message += f"\n\nThe saved index was not loaded: {self._index_problem}."
+            messagebox.showwarning("No Data", message)
             return
 
         self._answering = True
