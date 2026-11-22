@@ -145,3 +145,23 @@ def test_overlap_zero_produces_no_overlap():
         count = sum(1 for c in merged if s["text"] in c["text"])
         assert count == 1
 
+
+
+def test_a_tiny_final_chunk_is_merged_into_the_previous_one():
+    # 19 segments reach the target; the 20th starts a chunk that is 32 words
+    # of repeated overlap and 8 new ones. That is the previous chunk again.
+    segs = build(n=20)
+    out = merge_segments(segs, target_words=150, overlap_words=30)
+
+    assert len(out) == 1
+    assert out[0]["text"].split() == " ".join(s["text"] for s in segs).split()
+    assert out[0]["start"] == segs[0]["start"] and out[0]["end"] == segs[-1]["end"]
+
+
+def test_a_final_chunk_with_enough_new_words_stays_separate():
+    segs = build(n=26)      # 7 segments, 56 new words, after the first chunk
+    out = merge_segments(segs, target_words=150, overlap_words=30)
+
+    assert len(out) == 2
+    assert out[1]["end"] == segs[-1]["end"]
+    assert out[1]["start"] < out[0]["end"]      # it still overlaps the chunk before it

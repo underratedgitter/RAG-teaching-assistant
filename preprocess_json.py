@@ -272,6 +272,7 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
     merged = []
     buf = []       # segment dicts, so overlap keeps its own timing
     buf_words = 0  # running total
+    carried = 0    # segments at the front of buf that the previous chunk already holds
 
     def flush():
         merged.append({
@@ -296,11 +297,20 @@ def merge_segments(chunks, target_words=150, overlap_words=30):
                 running += words
                 tail.insert(0, s)
             buf, buf_words = tail, running
+            carried = len(tail)
         buf.append(seg)
         buf_words += len(seg["text"].split())
 
     if buf:
-        flush()
+        new = buf[carried:]
+        if merged and sum(len(s["text"].split()) for s in new) < target_words / 3:
+            # A last chunk that is mostly the overlap already in the chunk
+            # before it would be a near-duplicate that ranks beside it, so
+            # its few new words join that chunk instead.
+            merged[-1]["end"] = new[-1]["end"]
+            merged[-1]["text"] = (merged[-1]["text"] + " " + " ".join(s["text"] for s in new)).strip()
+        else:
+            flush()
     return merged
 
 
