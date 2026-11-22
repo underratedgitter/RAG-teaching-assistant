@@ -118,6 +118,16 @@ Instructions:
 - Be concise but thorough."""
 
 
+# Put just before the question when nothing cleared SIMILARITY_THRESHOLD and the
+# best few chunks were sent anyway. A small model told only to use the
+# excerpts answers from whatever it is given, and from its own memory when
+# they are unrelated; as an instruction beside the question this is followed.
+LOW_RELEVANCE_NOTE = (
+    "Retrieval scored the excerpts above as unrelated to the question below. "
+    "Unless an excerpt clearly answers it, say that the lectures do not cover it."
+)
+
+
 def _has_gpu_offload():
     """Whether Ollama can offload layers to a GPU on this machine.
 
@@ -198,9 +208,9 @@ def _excerpt_tokens(row):
     return _estimate_tokens(str(row.get("text", ""))) + EXCERPT_TAG_TOKENS
 
 
-def _excerpt_budget(question, system=SYSTEM_PROMPT):
+def _excerpt_budget(question):
     """Tokens left for excerpts once the instructions, question and answer are paid for."""
-    used = (_estimate_tokens(system) + _estimate_tokens(str(question))
+    used = (_estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(str(question))
             + NUM_PREDICT + PROMPT_OVERHEAD_TOKENS)
     return max(0, MAX_CONTEXT_TOKENS - used)
 
@@ -267,11 +277,13 @@ def _time_parts(value):
         return (0, 0)
 
 
-def format_sources(rows, limit=3):
+def format_sources(rows, limit=3, low_relevance=False):
     """A "Sources:" line for the chunks the answer drew on, best match first.
 
     Built from the retrieved rows, not from the model's text: a small model
-    does not reliably write the timestamps it was given.
+    does not reliably write the timestamps it was given. Chunks that scored
+    below the threshold are not what the answer rests on, so they are listed
+    as the closest passages, not as sources.
     """
     seen = []
     for row in rows:
@@ -284,15 +296,17 @@ def format_sources(rows, limit=3):
         )
         if source not in seen:
             seen.append(source)
-    return "Sources: " + "; ".join(seen[:limit])
+    label = "Closest passages (low relevance):" if low_relevance else "Sources:"
+    return f"{label} " + "; ".join(seen[:limit])
 
 
-def build_prompt(rows, question, tag):
+def build_prompt(rows, question, tag, low_relevance=False):
     """Build the user prompt: tagged excerpts, then the tagged question.
 
     `rows` are best match first. They are written worst first, so the best
     excerpt sits next to the question, where a small model attends most and
-    where truncation reaches last.
+    where truncation reaches last. `low_relevance` adds a note that the
+    retrieval scored them as unrelated to the question.
 
     The tag is random per request, so the system prompt cannot name it in
     advance and pasted content cannot guess the delimiter to fake a closing
@@ -312,6 +326,8 @@ def build_prompt(rows, question, tag):
             f'{_neutralise_tags(str(row.get("text", "")))}\n'
             f'</excerpt-{tag}>'
         )
+    if low_relevance:
+        parts.append(LOW_RELEVANCE_NOTE)
     parts.append(
         f"<question-{tag}>\n{_neutralise_tags(str(question))}\n</question-{tag}>"
     )
@@ -1110,7 +1126,7 @@ class RAGDashboard:
             # it in advance and pasted content cannot close its own block.
             tag = secrets.token_hex(8)
             rows = _fit_rows(chunks.to_dict("records"), _excerpt_budget(question))
-            prompt = build_prompt(rows, question, tag)
+            prompt = build_prompt(rows, question, tag, low_relevance=fallback)
 
             r = session.post(f"{OLLAMA_URL}/api/generate",
                 json={
@@ -1131,7 +1147,7 @@ class RAGDashboard:
             answer = reply["response"]
             if reply.get("done_reason") == "length":
                 answer += "\n\n[answer truncated]"
-            response = f"{answer}\n\n{format_sources(rows)}"
+            response = f"{answer}\n\n{format_sources(rows, low_relevance=fallback)}"
 
             self.log_safe("Done!")
             self._ui_queue.put(lambda: self._show_response(response))

@@ -76,6 +76,7 @@ _CONSTANTS = {
     "DOCUMENT_PREFIX",
     "QUERY_PREFIX",
     "SYSTEM_PROMPT",
+    "LOW_RELEVANCE_NOTE",
     "VIDEO_EXTENSIONS",
     "GENERATION_OPTIONS",
     "NUM_PREDICT",
@@ -766,15 +767,41 @@ def test_a_repeated_chunk_location_is_listed_once(ns):
     assert _shown(app).endswith("Sources: Video 1 (Lecture 1) 0:00\u20130:30")
 
 
-def test_the_fallback_chunks_are_listed_as_sources(ns):
+def test_the_fallback_chunks_are_not_presented_as_sources(ns):
+    """Passages that scored below the threshold are not what the answer rests on."""
     df, matrix = _corpus([0.22, 0.19, 0.18, 0.10])
     app, session, logs = _answer_app(df, matrix)
 
     ns["_answer"](app, "What is this?")
 
-    sources = _shown(app).split("Sources: ")[1]
-    assert sources.count(";") == 2
-    assert "Video 4" not in sources
+    shown = _shown(app)
+    assert "Sources:" not in shown
+    closest = shown.split("Closest passages (low relevance): ")[1]
+    assert closest.count(";") == 2
+    assert "Video 4" not in closest
+
+
+def test_the_model_is_told_the_fallback_excerpts_scored_as_unrelated(ns):
+    df, matrix = _corpus([0.22, 0.19, 0.18])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    prompt = _prompt_of(session)
+    assert ns["LOW_RELEVANCE_NOTE"] in prompt
+    assert "as unrelated" in prompt and "do not cover" in prompt
+    # Beside the question, after the excerpts it is about.
+    assert prompt.rindex("</excerpt-") < prompt.index(ns["LOW_RELEVANCE_NOTE"]) < prompt.index("<question-")
+
+
+def test_the_model_is_not_told_that_for_excerpts_above_the_threshold(ns):
+    df, matrix = _corpus([0.9, 0.8])
+    app, session, logs = _answer_app(df, matrix)
+
+    ns["_answer"](app, "What is this?")
+
+    assert ns["LOW_RELEVANCE_NOTE"] not in _prompt_of(session)
+    assert "Closest passages" not in _shown(app)
 
 
 @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
