@@ -688,3 +688,25 @@ def test_torch_is_no_longer_a_dependency():
     assert not any(ln.startswith("torch") for ln in reqs if ln)
     for script in ("mp3_to_json.py", "preprocess_json.py", "dashboard.py"):
         assert "import torch" not in (ROOT / script).read_text()
+
+
+def test_only_audio_without_a_video_is_orphaned(tmp_path, monkeypatch):
+    h = _video_helpers(tmp_path, monkeypatch)
+    existing = {"1_lecture.mp3", "2_gone.mp4.mp3", "3_new.mkv.mp3", ".4_x.mp3.partial", "notes.txt"}
+    for name in existing:
+        (tmp_path / "audios" / name).write_bytes(b"audio")
+    files = ["lecture.mp4", "new.mkv"]
+    jobs = h["_plan_conversions"](files, existing)
+
+    assert h["_orphaned_audio"](files, jobs, existing) == ["2_gone.mp4.mp3"]
+
+
+def test_ambiguous_legacy_audio_is_not_orphaned(tmp_path, monkeypatch):
+    """Two videos share its stem: the ambiguity path moves it once they are converted."""
+    h = _video_helpers(tmp_path, monkeypatch)
+    existing = {"7_lecture.mp3"}
+    (tmp_path / "audios" / "7_lecture.mp3").write_bytes(b"audio")
+    files = ["lecture.mp4", "lecture.mov"]
+    jobs = h["_plan_conversions"](files, existing)
+
+    assert h["_orphaned_audio"](files, jobs, existing) == []

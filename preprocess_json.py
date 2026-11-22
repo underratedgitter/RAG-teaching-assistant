@@ -87,6 +87,25 @@ def save_cached(json_file, texts, embeddings):
             pass
 
 
+def prune_cache(json_files):
+    """Delete cached embeddings whose transcript is gone.
+
+    A lecture whose video was deleted has its transcript moved out of
+    jsons/, and its cache would otherwise sit in .embed_cache/ for good.
+    """
+    wanted = {f"{name}.npz" for name in json_files}
+    try:
+        cached = os.listdir(CACHE_DIR)
+    except OSError:
+        return
+    for name in cached:
+        if name.endswith(".npz") and name not in wanted:
+            try:
+                os.remove(os.path.join(CACHE_DIR, name))
+            except OSError as e:
+                print(f"   [WARNING] Could not remove stale cache {name}: {e}")
+
+
 def _plain(value):
     """numpy scalars are not JSON types; unwrap them before dumping."""
     if isinstance(value, np.generic):
@@ -295,6 +314,7 @@ os.makedirs("jsons", exist_ok=True)
 # Sorted so chunk_ids are stable from run to run; listdir order is arbitrary.
 jsons = sorted(f for f in os.listdir("jsons") if f.endswith('.json'))
 print(f"\n[*] Found {len(jsons)} JSON files")
+prune_cache(jsons)
 print(f"PROGRESS 0/{len(jsons)}", flush=True)
 
 my_dicts = []

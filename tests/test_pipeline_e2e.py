@@ -305,3 +305,30 @@ def test_a_stage_killed_midway_leaves_nothing_a_rerun_would_trust(workspace, sta
     rerun = _run(workspace, stage)
     assert rerun.returncode == 0, rerun.stdout
     assert finished() != []
+
+
+def _run_all(workspace):
+    for script in ("video_to_mp3.py", "mp3_to_json.py", "preprocess_json.py"):
+        done = _run(workspace, script)
+        assert done.returncode == 0, done.stdout
+
+
+def test_a_deleted_lecture_leaves_the_index(workspace):
+    """Removing a video from videos/ must remove its lecture from the answers."""
+    root = workspace.root
+    for name in ("keep.mp4", "drop.mp4"):
+        (root / "videos" / name).write_bytes(b"recording")
+    _run_all(workspace)
+    assert set(_dashboard_loader(workspace).df["title"]) == {"keep", "drop"}
+
+    (root / "videos" / "drop.mp4").unlink()
+    _run_all(workspace)
+
+    assert set(_dashboard_loader(workspace).df["title"]) == {"keep"}
+    assert sorted(p.name for p in (root / "audios").glob("*.mp3")) == ["2_keep.mp4.mp3"]
+    assert sorted(p.name for p in (root / "jsons").iterdir()) == ["2_keep.mp4.mp3.json"]
+    # Moved aside, not deleted, so nothing the user made is lost for good.
+    orphaned = sorted(p.name for p in (root / "audios" / ".orphaned").iterdir())
+    assert "1_drop.mp4.mp3" in orphaned and "1_drop.mp4.mp3.json" in orphaned
+    # The embedding cache of the removed transcript goes too.
+    assert sorted(p.name for p in (root / ".embed_cache").iterdir()) == ["2_keep.mp4.mp3.json.npz"]
